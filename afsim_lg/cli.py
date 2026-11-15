@@ -90,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
             "run_id": state["run_id"],
             "status": state.get("status"),
             "generations": state.get("generation", 1),
+            "generation_mode": state.get("generation_mode", ""),
             "run_dir": str(get_settings().runs_dir / state["run_id"]),
             "files": sorted(state.get("files", {})),
             "contract": state.get("contract", {}),

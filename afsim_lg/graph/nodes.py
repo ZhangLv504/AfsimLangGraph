@@ -7,11 +7,13 @@ from pathlib import Path
 
 from afsim_lg.afsim.evt import find_evt, parse_evt
 from afsim_lg.afsim.runner import run_mission
+from afsim_lg.afsim.statics import check_platform_types
 from afsim_lg.config import get_settings
 from afsim_lg.contract import ScenarioContract, parse_contract
 from afsim_lg.graph.checks import evaluate
 from afsim_lg.graph.state import MainState
 from afsim_lg.llm import chat
+from afsim_lg.rag.errors import extract_error_keywords, search_error_refs
 from afsim_lg.rag.index import search
 
 FILE_MARK_RE = re.compile(r"^===FILE:\s*(.+?)\s*===$")
@@ -21,6 +23,8 @@ FENCE_RE = re.compile(r"^(```|~~~)")
 MAX_FILES = 12
 CORPUS_CHARS = 1400
 MAIN_CHARS = 4000
+# 定向修复时每个文件的展示上限：只看错误附近，避免整份工程撑爆上下文
+REPAIR_FILE_CHARS = 3000
 
 # 注入的事件块包含 PLATFORM_ADDED：没有它，evt 里就没有平台阵营，无法按阵营验收
 EVENT_OUTPUT_STANZA = """event_output
@@ -72,6 +76,22 @@ JUDGE_SYSTEM = """你是 AFSIM 场景验收员。对照用户需求与需求契�
 3. 契约 expectations 为空时，不得因为“没有探测/发射/命中”判失败。
 4. missing 必须是需求原文能对应的具体缺失（平台、阵营、装备、时长、明确要求的事件），不能是推测。
 5. 确定性检查全部通过且找不到具体缺失时，passed 应为 true。"""
+
+
+REPAIR_SYSTEM = """你是 AFSIM 2.9.0 场景修复器。根据错误反馈与当前工程，只输出需要修改的文件。
+
+输出格式必须严格如下，不要使用 Markdown 代码围栏：
+===FILE: main.txt===
+<修改后的完整文件内容>
+===END===
+
+规则：
+1. 只输出必须改动的文件；没有输出的文件，系统会保留原样。
+2. 每个输出文件必须给出完整内容，不能只给片段或 diff。
+3. 保留当前工程中已经正确的部分，把改动限制在错误相关的最小范围。
+4. platform 引用的 platform_type 必须有定义；每个块用对应的 end_ 闭合。
+5. 注释必须独立成行；不要使用 thread_count。
+6. 错误信息不足以判断时，宁可原样输出当前文件，也不要新增未定义的类型或命令。"""
 
 
 def _run_dir(state: MainState) -> Path:
@@ -217,37 +237,79 @@ def retrieve(state: MainState) -> dict:
     return {"retrieved": hits}
 
 
-def generate(state: MainState) -> dict:
-    """调用生成模型，要求按文件标记输出完整工程。
-
-    第一次解析不到文件时追加一条格式提醒再试一次；仍失败则把错误交给
-    修复分支，而不是让整次运行异常退出。
-    """
-    user_parts = [f"【需求】\n{state['requirement']}"]
+def _common_parts(state: MainState) -> list[str]:
+    """组装需求、契约、反馈与报错参考，供整份生成和定向修复共用。"""
+    parts = [f"【需求】\n{state['requirement']}"]
     contract = state.get("contract")
     if contract:
         # 契约约束平台、时长与事件范围，减少模型按常识补装备
-        user_parts.append(
+        parts.append(
             "【需求契约】\n" + json.dumps(contract, ensure_ascii=False, indent=1)
         )
     if state.get("feedback"):
         # 反馈来自上一轮的 mission 报错与验收缺口，定向修比整份重写省上下文
-        user_parts.append(f"【上一轮失败反馈】\n{state['feedback']}")
-    user_parts.append(f"【技能检索片段】\n{_corpus_block(state.get('retrieved', []))}")
-    user_parts.append("请输出完整工程文件。")
-    prompt = "\n\n".join(user_parts)
+        parts.append(f"【上一轮失败反馈】\n{state['feedback']}")
+    if state.get("error_refs"):
+        parts.append(f"【报错参考片段】\n{_corpus_block(state['error_refs'])}")
+    return parts
 
+
+def _full_generate(state: MainState) -> tuple[dict[str, str], str]:
+    """整份重生成，返回文件映射与错误信息。"""
+    prompt = "\n\n".join(
+        _common_parts(state)
+        + [
+            f"【技能检索片段】\n{_corpus_block(state.get('retrieved', []))}",
+            "请输出完整工程文件。",
+        ]
+    )
     files = parse_files(chat(GENERATOR_SYSTEM, prompt))
     if not files:
         # 7B 模型偶尔漏掉文件标记；先补一次格式要求，不占用修复轮次
         retry_prompt = prompt + "\n\n注意：你的输出没有可解析的文件标记。只输出文件标记格式。"
         files = parse_files(chat(GENERATOR_SYSTEM, retry_prompt))
     error = "" if files else "模型输出中没有可解析的 ===FILE: ... === 文件块"
+    return files, error
+
+
+def _repair_files(state: MainState) -> dict[str, str]:
+    """让模型只输出需要修改的文件；解析不到时返回空字典。"""
+    blocks = [
+        f"===FILE: {name}===\n{content[:REPAIR_FILE_CHARS]}"
+        for name, content in state.get("files", {}).items()
+    ]
+    prompt = "\n\n".join(
+        _common_parts(state)
+        + ["【当前工程】\n" + "\n\n".join(blocks), "只输出需要修改的文件。"]
+    )
+    return parse_files(chat(REPAIR_SYSTEM, prompt))
+
+
+def generate(state: MainState) -> dict:
+    """生成工程；有上一轮文件时优先定向修复，否则整份生成。
+
+    修复输出无法解析时退回整份生成；仍失败则把错误交给修复分支，而不是
+    让整次运行异常退出。
+    """
+    files: dict[str, str] = {}
+    mode = "full"
+    if state.get("files") and state.get("feedback"):
+        changed = _repair_files(state)
+        if changed:
+            # 只覆盖模型返回的文件，未返回的沿用上一轮
+            files = dict(state["files"])
+            files.update(changed)
+            mode = "repair"
+    if files:
+        error = ""
+    else:
+        files, error = _full_generate(state)
     return {
         "files": files,
         "generation_error": error,
         # 生成次数单独计数；用 attempt + 1 推算会把修复轮次也算成一次生成
         "generation": state.get("generation", 0) + 1,
+        "generation_mode": mode,
     }
 
 
@@ -297,16 +359,37 @@ def write_files(state: MainState) -> dict:
 
 
 def validate(state: MainState) -> dict:
-    """在运行目录执行 mission.exe。
+    """先做静态引用检查，通过后再在运行目录执行 mission.exe。
 
+    静态检查失败时跳过 mission.exe：省一次完整运行，错误文案也足够定位。
     完整输出只落盘，状态里仅保留摘要，避免 checkpoint 体积随日志增长。
     """
     run_dir = _run_dir(state)
+    attempt_dir = Path(state["attempt_dir"]) if state.get("attempt_dir") else _attempt_dir(state)
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+
+    static_errors = check_platform_types(state.get("files", {}))
+    _write_json(attempt_dir / "static.json", {"ok": not static_errors, "errors": static_errors})
+    if static_errors:
+        output = "静态检查失败，未运行 mission.exe：\n" + "\n".join(static_errors)
+        # 运行目录只保留最新一轮输出，attempt 目录保留历史，内容相同
+        (run_dir / "mission_stdout.log").write_text(output, encoding="utf-8")
+        (attempt_dir / "mission_stdout.log").write_text(output, encoding="utf-8")
+        mission = {
+            "ok": False,
+            # 负数表示引擎没有真正启动，与超时的 -1 区分
+            "exit_code": -2,
+            "elapsed_sec": 0.0,
+            "timed_out": False,
+            "errors": static_errors,
+            "static_failed": True,
+        }
+        _write_json(attempt_dir / "mission.json", mission)
+        return {"mission": mission}
+
     result = run_mission(run_dir)
     # 运行目录只保留最新一轮输出，attempt 目录保留历史，内容相同
     (run_dir / "mission_stdout.log").write_text(result.output, encoding="utf-8")
-    attempt_dir = Path(state["attempt_dir"]) if state.get("attempt_dir") else _attempt_dir(state)
-    attempt_dir.mkdir(parents=True, exist_ok=True)
     (attempt_dir / "mission_stdout.log").write_text(result.output, encoding="utf-8")
     mission = {
         "ok": result.ok,
@@ -352,13 +435,14 @@ def assess(state: MainState) -> dict:
         assessment = {
             "passed": False,
             "missing": mission.get("errors", []),
-            "fix_hint": "先修复 mission.exe 报错。",
+            "fix_hint": "先修复静态检查错误。" if mission.get("static_failed") else "先修复 mission.exe 报错。",
         }
         _write_json(attempt_dir / "assessment.json", assessment)
         _write_json(
             attempt_dir / "summary.json",
             {
                 "attempt": _attempt_no(state),
+                "generation_mode": state.get("generation_mode", ""),
                 "files": sorted(state.get("files", {})),
                 "mission": mission,
                 "checks": [],
@@ -400,6 +484,7 @@ def assess(state: MainState) -> dict:
         attempt_dir / "summary.json",
         {
             "attempt": _attempt_no(state),
+            "generation_mode": state.get("generation_mode", ""),
             "files": sorted(state.get("files", {})),
             "mission": mission,
             "checks": checks,
@@ -416,7 +501,7 @@ def assess(state: MainState) -> dict:
 
 
 def fix(state: MainState) -> dict:
-    """汇总本轮错误与验收缺口，作为下一轮生成的反馈。"""
+    """汇总本轮错误与验收缺口，检索对应教训，作为下一轮生成的反馈。"""
     assessment = state.get("assessment", {})
     mission = state.get("mission", {})
     failed_dir = _attempt_dir(state)
@@ -426,6 +511,7 @@ def fix(state: MainState) -> dict:
             failed_dir / "summary.json",
             {
                 "attempt": _attempt_no(state),
+                "generation_mode": state.get("generation_mode", ""),
                 "generation_error": state.get("generation_error", ""),
                 "files": [],
                 "assessment": assessment,
@@ -433,12 +519,34 @@ def fix(state: MainState) -> dict:
         )
     parts = []
     if mission.get("errors"):
-        parts.append("mission.exe 报错：\n" + "\n".join(mission["errors"]))
+        # 静态检查失败时引擎没有启动，标注清楚避免模型当成运行期错误去猜
+        label = "静态检查错误" if mission.get("static_failed") else "mission.exe 报错"
+        parts.append(f"{label}：\n" + "\n".join(mission["errors"]))
     if assessment.get("missing"):
         parts.append("需求缺失：\n" + "\n".join(assessment["missing"]))
     if assessment.get("fix_hint"):
         parts.append("修改建议：\n" + assessment["fix_hint"])
-    return {"attempt": state.get("attempt", 0) + 1, "feedback": "\n\n".join(parts)}
+    feedback = "\n\n".join(parts)
+
+    keywords = extract_error_keywords(mission.get("errors", []))
+    refs = search_error_refs(keywords)
+    _write_json(
+        failed_dir / "fix.json",
+        {
+            "feedback": feedback,
+            "keywords": keywords,
+            "hits": [
+                {"keyword": hit["keyword"], **hit["metadata"], "document": hit["document"]}
+                for hit in refs
+            ],
+        },
+    )
+    return {
+        "attempt": state.get("attempt", 0) + 1,
+        "feedback": feedback,
+        "error_keywords": keywords,
+        "error_refs": refs,
+    }
 
 
 def finalize(state: MainState) -> dict:

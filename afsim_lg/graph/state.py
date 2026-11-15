@@ -13,9 +13,14 @@ class MainState(TypedDict, total=False):
     run_id: str
     requirement: str
     max_attempts: int
-    # attempt 由 fix 递增，generation 由 generate 递增；两者口径不同，统计生成次数只看 generation
+    # attempt 由 fix 递增；generation 统计生成节点执行次数，后者才是实际生成轮数
     attempt: int
     generation: int
+    # full / repair：本轮是整份生成还是只改部分文件
+    generation_mode: str
+    # 上一轮报错检索到的 ref/lesson 片段，供下一轮生成参考
+    error_keywords: list[str]
+    error_refs: list[dict]
     contract: dict
     contract_error: str
     retrieved: list[dict]
