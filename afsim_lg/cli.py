@@ -75,11 +75,16 @@ def main(argv: list[str] | None = None) -> int:
         summary = {
             "run_id": state["run_id"],
             "status": state.get("status"),
-            "generations": state.get("attempt", 0) + 1,
+            "generations": state.get("generation", 1),
             "run_dir": str(get_settings().runs_dir / state["run_id"]),
             "files": sorted(state.get("files", {})),
+            "contract": state.get("contract", {}),
+            "contract_error": state.get("contract_error", ""),
             "mission": state.get("mission", {}),
+            "checks": state.get("checks", []),
+            "evidence": state.get("evidence", {}),
             "assessment": state.get("assessment", {}),
+            "manifest": str(get_settings().runs_dir / state["run_id"] / "manifest.json"),
         }
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0 if summary["status"] == "passed" else 1

@@ -11,6 +11,7 @@ from afsim_lg.graph.state import MainState
 
 def build_graph(checkpointer=None):
     graph = StateGraph(MainState)
+    graph.add_node("parse_requirement", nodes.parse_requirement)
     graph.add_node("retrieve", nodes.retrieve)
     graph.add_node("generate", nodes.generate)
     graph.add_node("write", nodes.write_files)
@@ -19,7 +20,8 @@ def build_graph(checkpointer=None):
     graph.add_node("fix", nodes.fix)
     graph.add_node("finalize", nodes.finalize)
 
-    graph.add_edge(START, "retrieve")
+    graph.add_edge(START, "parse_requirement")
+    graph.add_edge("parse_requirement", "retrieve")
     graph.add_edge("retrieve", "generate")
     graph.add_conditional_edges(
         "generate",
