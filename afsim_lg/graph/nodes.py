@@ -1,3 +1,5 @@
+"""LangGraph 节点：需求解析、生成、落盘、校验、验收、修复与收尾。"""
+
 import json
 import re
 from datetime import datetime
@@ -15,10 +17,12 @@ from afsim_lg.rag.index import search
 FILE_MARK_RE = re.compile(r"^===FILE:\s*(.+?)\s*===$")
 END_MARK_RE = re.compile(r"^===END===$")
 FENCE_RE = re.compile(r"^(```|~~~)")
+# 下列上限用于控制单次模型的上下文：文件数、每个检索片段、验收时读取的 main.txt
 MAX_FILES = 12
 CORPUS_CHARS = 1400
 MAIN_CHARS = 4000
 
+# 注入的事件块包含 PLATFORM_ADDED：没有它，evt 里就没有平台阵营，无法按阵营验收
 EVENT_OUTPUT_STANZA = """event_output
    file output/events.evt
    enable PLATFORM_ADDED
@@ -71,18 +75,22 @@ JUDGE_SYSTEM = """你是 AFSIM 场景验收员。对照用户需求与需求契�
 
 
 def _run_dir(state: MainState) -> Path:
+    """当前运行的全部产物目录。"""
     return get_settings().runs_dir / state["run_id"]
 
 
 def _attempt_no(state: MainState) -> int:
+    """当前是第几轮生成（从 1 开始）。"""
     return state.get("attempt", 0) + 1
 
 
 def _attempt_dir(state: MainState) -> Path:
+    """当前轮次的留痕目录。"""
     return _run_dir(state) / "attempts" / f"attempt-{_attempt_no(state):02d}"
 
 
 def _write_json(path: Path, payload) -> None:
+    """以 UTF-8、不转义中文的方式写 JSON。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -92,6 +100,7 @@ def _write_json(path: Path, payload) -> None:
 
 
 def _corpus_block(hits: list[dict]) -> str:
+    """把检索命中拼成给模型的参考片段。"""
     parts = []
     for i, hit in enumerate(hits, 1):
         meta = hit["metadata"]
@@ -103,6 +112,7 @@ def _corpus_block(hits: list[dict]) -> str:
 
 
 def _clean(content: str) -> str:
+    """去掉模型额外包上的 Markdown 代码围栏。"""
     lines = content.strip().splitlines()
     if len(lines) >= 2 and FENCE_RE.match(lines[0].strip()) and FENCE_RE.match(lines[-1].strip()):
         lines = lines[1:-1]
@@ -110,11 +120,23 @@ def _clean(content: str) -> str:
 
 
 def parse_files(text: str) -> dict[str, str]:
+    """按 `===FILE: 名称===` 标记拆分模型输出。
+
+    按行解析而不是整段正则：模型经常在末尾多写 `===END===` 或代码围栏，
+    只靠非贪婪正则会把标记吞进最后一个文件。
+
+    Args:
+        text: 模型输出全文。
+
+    Returns:
+        文件名到内容的映射；空文件被丢弃。
+    """
     files: dict[str, str] = {}
     current: str | None = None
     buffer: list[str] = []
 
     def flush():
+        """把当前累积的文件内容提交到结果，并清空缓冲区。"""
         if current and buffer:
             body = _clean("\n".join(buffer))
             if body:
@@ -138,6 +160,11 @@ def parse_files(text: str) -> dict[str, str]:
 
 
 def _safe_path(run_dir: Path, name: str) -> Path | None:
+    """把模型给出的文件名限制在运行目录内，只接受 .txt。
+
+    模型可能输出绝对路径或目录穿越，这里返回 None 而不是抛异常，让单个
+    非法文件被跳过而不中断整轮生成。
+    """
     if name.startswith("/") or ":" in name or ".." in Path(name).parts:
         return None
     if Path(name).suffix.lower() != ".txt":
@@ -149,6 +176,18 @@ def _safe_path(run_dir: Path, name: str) -> Path | None:
 
 
 def _ensure_event_output(files: dict[str, str], contract: ScenarioContract) -> tuple[dict, bool]:
+    """契约要求事件但工程没写 event_output 时补一段标准配置。
+
+    只在完全缺失时注入；模型已写 event_output 就不改，避免覆盖它自定义的
+    事件选择。
+
+    Args:
+        files: 生成文件映射。
+        contract: 当前需求契约。
+
+    Returns:
+        处理后的文件映射与是否发生注入。
+    """
     if not contract.needs_event_evidence:
         return files, False
     if any("event_output" in content for content in files.values()):
@@ -161,6 +200,7 @@ def _ensure_event_output(files: dict[str, str], contract: ScenarioContract) -> t
 
 
 def parse_requirement(state: MainState) -> dict:
+    """把自然语言需求解析为契约并落盘。"""
     run_dir = _run_dir(state)
     run_dir.mkdir(parents=True, exist_ok=True)
     contract, error = parse_contract(state["requirement"])
@@ -171,11 +211,17 @@ def parse_requirement(state: MainState) -> dict:
 
 
 def retrieve(state: MainState) -> dict:
+    """按需求检索技能语料 Top-8。"""
     hits = search(state["requirement"], k=8)
     return {"retrieved": hits}
 
 
 def generate(state: MainState) -> dict:
+    """调用生成模型，要求按文件标记输出完整工程。
+
+    第一次解析不到文件时追加一条格式提醒再试一次；仍失败则把错误交给
+    修复分支，而不是让整次运行异常退出。
+    """
     user_parts = [f"【需求】\n{state['requirement']}"]
     contract = state.get("contract")
     if contract:
@@ -201,6 +247,7 @@ def generate(state: MainState) -> dict:
 
 
 def write_files(state: MainState) -> dict:
+    """把生成文件写入运行目录，并复制一份到本轮的留痕目录。"""
     run_dir = _run_dir(state)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "output").mkdir(exist_ok=True)
@@ -218,6 +265,7 @@ def write_files(state: MainState) -> dict:
     if not written:
         return {"generation_error": "没有可写入的文件"}
 
+    # 先留证据再进入校验：下一轮会覆盖运行目录里的同名文件
     attempt_dir = _attempt_dir(state)
     attempt_dir.mkdir(parents=True, exist_ok=True)
     for name, content in list(files.items())[:MAX_FILES]:
@@ -242,6 +290,10 @@ def write_files(state: MainState) -> dict:
 
 
 def validate(state: MainState) -> dict:
+    """在运行目录执行 mission.exe。
+
+    完整输出只落盘，状态里仅保留摘要，避免 checkpoint 体积随日志增长。
+    """
     run_dir = _run_dir(state)
     result = run_mission(run_dir)
     (run_dir / "mission_stdout.log").write_text(result.output, encoding="utf-8")
@@ -260,6 +312,7 @@ def validate(state: MainState) -> dict:
 
 
 def _judge(state: MainState, checks: list[dict], evidence: dict) -> dict:
+    """让验收模型只处理确定性检查覆盖不到的需求。"""
     run_dir = _run_dir(state)
     main_txt = ""
     main_path = run_dir / "main.txt"
@@ -281,6 +334,7 @@ def _judge(state: MainState, checks: list[dict], evidence: dict) -> dict:
 
 
 def assess(state: MainState) -> dict:
+    """先做确定性检查，再让模型补充判断，并保存本轮验收证据。"""
     mission = state.get("mission", {})
     attempt_dir = Path(state["attempt_dir"]) if state.get("attempt_dir") else _attempt_dir(state)
 
@@ -320,6 +374,7 @@ def assess(state: MainState) -> dict:
         fix_hint = "重新生成并确保满足需求。"
 
     failed = [f"{c['name']}: {c['detail']}" for c in checks if not c["ok"]]
+    # 确定性检查与模型判断是“与”关系：任何一项失败都不算通过
     passed = all(c["ok"] for c in checks) and judge_passed
     assessment = {
         "passed": passed,
@@ -350,9 +405,11 @@ def assess(state: MainState) -> dict:
 
 
 def fix(state: MainState) -> dict:
+    """汇总本轮错误与验收缺口，作为下一轮生成的反馈。"""
     assessment = state.get("assessment", {})
     mission = state.get("mission", {})
     failed_dir = _attempt_dir(state)
+    # 生成阶段就失败的轮次没有 summary，这里补一条；已存在的不要覆盖
     if not (failed_dir / "summary.json").exists():
         _write_json(
             failed_dir / "summary.json",
@@ -374,6 +431,7 @@ def fix(state: MainState) -> dict:
 
 
 def finalize(state: MainState) -> dict:
+    """汇总各轮留痕，写出 manifest 并给出最终状态。"""
     passed = state.get("assessment", {}).get("passed", False)
     status = "passed" if passed else "failed"
     run_dir = _run_dir(state)
@@ -404,14 +462,17 @@ def finalize(state: MainState) -> dict:
 
 
 def route_after_generate(state: MainState) -> str:
+    """有可写入文件则继续落盘，否则进入修复分支。"""
     return "write" if state.get("files") and not state.get("generation_error") else "fix"
 
 
 def route_after_fix(state: MainState) -> str:
+    """未达生成上限时重试，否则收尾。"""
     if state.get("attempt", 0) >= state.get("max_attempts", 2):
         return "finalize"
     return "generate"
 
 
 def route_after_assess(state: MainState) -> str:
+    """验收通过直接收尾，否则回到修复。"""
     return "finalize" if state.get("status") == "passed" else "fix"

@@ -1,3 +1,5 @@
+"""Chroma 索引的建库、写入与检索。"""
+
 import hashlib
 import time
 from dataclasses import dataclass
@@ -14,6 +16,8 @@ WRITE_BATCH = 64
 
 @dataclass
 class IndexStats:
+    """一次建库的结果摘要。"""
+
     chunks: int
     files: int
     seconds: float
@@ -22,6 +26,7 @@ class IndexStats:
 
 
 def _chunk_id(chunk: Chunk) -> str:
+    """用“技能:路径:序号”生成稳定 ID，重复建库时覆盖同一块而不是追加。"""
     key = f"{chunk.skill}:{chunk.path}:{chunk.chunk_index}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
@@ -38,6 +43,17 @@ def _metadata(chunk: Chunk) -> dict:
 
 
 def get_collection(create: bool = True):
+    """打开语料集合。
+
+    embedding_function=None 是刻意的：Chroma 默认会自动下载 ONNX 模型，
+    这里统一由 bge-m3 生成向量并显式传入，避免联网和模型不一致。
+
+    Args:
+        create: 集合不存在时是否创建。
+
+    Returns:
+        Chroma 集合对象。
+    """
     settings = get_settings()
     client = chromadb.PersistentClient(path=str(settings.chroma_dir))
     if create:
@@ -50,6 +66,15 @@ def get_collection(create: bool = True):
 
 
 def build_index(base: Path, rebuild: bool = False) -> IndexStats:
+    """切块、向量化并写入 Chroma。
+
+    Args:
+        base: 技能语料根目录。
+        rebuild: 是否先删除已有集合。
+
+    Returns:
+        块数、文件数、耗时等统计。
+    """
     settings = get_settings()
     started = time.monotonic()
     client = chromadb.PersistentClient(path=str(settings.chroma_dir))
@@ -83,6 +108,16 @@ def build_index(base: Path, rebuild: bool = False) -> IndexStats:
 
 
 def search(query: str, k: int = 8, where: dict | None = None) -> list[dict]:
+    """按自然语言查询检索语料块。
+
+    Args:
+        query: 查询文本。
+        k: 返回条数。
+        where: Chroma 元数据过滤条件。
+
+    Returns:
+        命中列表，包含正文、元数据与 cosine 距离。
+    """
     collection = get_collection(create=False)
     result = collection.query(
         query_embeddings=[embed_query(query)],

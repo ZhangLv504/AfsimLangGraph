@@ -1,3 +1,5 @@
+"""命令行入口：环境检查、建库、检索、单次校验与完整生成流程。"""
+
 import argparse
 import json
 import sys
@@ -11,6 +13,7 @@ from afsim_lg.rag.index import build_index, search
 
 
 def _mission_dict(result) -> dict:
+    """把 MissionResult 转成可打印的字典。"""
     return {
         "ok": result.ok,
         "exit_code": result.exit_code,
@@ -23,6 +26,14 @@ def _mission_dict(result) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """解析子命令并执行。
+
+    Args:
+        argv: 参数列表；None 时使用 sys.argv。
+
+    Returns:
+        进程退出码；run/validate 未通过时返回 1。
+    """
     parser = argparse.ArgumentParser(prog="afsim-lg")
     sub = parser.add_subparsers(dest="command", required=True)
 

@@ -1,3 +1,11 @@
+"""解析 AFSIM 事件输出（.evt）文件。
+
+实测格式要点：
+- 时间戳有两种写法：`300.00000`（秒）和 `00:02:10.0`（h:m:s）。
+- 长消息用行尾反斜杠续行，按行解析前必须先合并。
+- 平台阵营只在 `PLATFORM_ADDED` 事件里出现，按阵营过滤事件依赖它。
+"""
+
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -10,6 +18,8 @@ RESULT_RE = re.compile(r"Result:\s*([A-Za-z_]+)")
 
 @dataclass
 class EvtSummary:
+    """一个 evt 文件的聚合结果。"""
+
     path: str = ""
     last_time_sec: float = 0.0
     counts: Counter = field(default_factory=Counter)
@@ -21,6 +31,7 @@ class EvtSummary:
     parse_errors: int = 0
 
     def to_dict(self) -> dict:
+        """转换为可 JSON 序列化的字典。"""
         return {
             "path": self.path,
             "last_time_sec": self.last_time_sec,
@@ -35,6 +46,14 @@ class EvtSummary:
 
 
 def time_to_seconds(value: str) -> float:
+    """把 `h:m:s` 或纯秒数转换成秒。
+
+    Args:
+        value: evt 行首的时间戳文本。
+
+    Returns:
+        对应的秒数。
+    """
     if ":" in value:
         parts = [float(p) for p in value.split(":")]
         seconds = 0.0
@@ -45,6 +64,16 @@ def time_to_seconds(value: str) -> float:
 
 
 def read_records(text: str) -> tuple[list[str], int]:
+    """把续行合并成完整记录。
+
+    反斜杠结尾表示消息未结束；空行只用于分隔记录，不参与拼接。
+
+    Args:
+        text: evt 文件全文。
+
+    Returns:
+        记录列表与解析失败计数。
+    """
     records: list[str] = []
     buffer = ""
     parse_errors = 0
@@ -66,6 +95,17 @@ def read_records(text: str) -> tuple[list[str], int]:
 
 
 def parse_evt(path: Path) -> EvtSummary:
+    """解析 evt 文件并统计关键事件。
+
+    探测按 (传感器平台, 目标) 去重，毁伤按被毁平台去重，避免同一交战的
+    重复上报把计数抬高。
+
+    Args:
+        path: evt 文件路径。
+
+    Returns:
+        事件计数、平台阵营映射与交战明细。
+    """
     summary = EvtSummary(path=str(path))
     text = path.read_text(encoding="utf-8", errors="replace")
     records, errors = read_records(text)
@@ -127,6 +167,14 @@ def parse_evt(path: Path) -> EvtSummary:
 
 
 def find_evt(run_dir: Path) -> Path | None:
+    """在运行目录的 output 下取最新的非空 evt。
+
+    Args:
+        run_dir: 运行工程目录。
+
+    Returns:
+        evt 路径；没有可用文件时返回 None。
+    """
     candidates = sorted(
         (p for p in (run_dir / "output").glob("*.evt") if p.stat().st_size > 0),
         key=lambda p: p.stat().st_mtime,

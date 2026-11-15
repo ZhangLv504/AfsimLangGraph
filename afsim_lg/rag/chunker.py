@@ -1,3 +1,5 @@
+"""技能语料切块：Markdown 按标题，AFSIM 文本按块结构。"""
+
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +24,8 @@ TOKEN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\b")
 
 @dataclass
 class Chunk:
+    """一个可独立检索的语料片段。"""
+
     text: str
     path: str
     skill: str
@@ -32,6 +36,11 @@ class Chunk:
     extra: dict = field(default_factory=dict)
 
     def embedding_text(self) -> str:
+        """拼出用于向量化的文本。
+
+        正文前加一行路径与类别头，让“同名但用途不同”的块（如模板与参考）
+        在向量空间里更容易区分。
+        """
         parts = [f"[{self.skill}/{self.path}]", self.kind]
         if self.heading:
             parts.append(self.heading)
@@ -42,6 +51,14 @@ class Chunk:
 
 
 def discover_skill_roots(base: Path) -> list[Path]:
+    """查找所有含 SKILL.md 的技能根目录。
+
+    Args:
+        base: 语料根目录。
+
+    Returns:
+        技能根目录列表。
+    """
     return sorted(
         p.parent
         for p in base.rglob("SKILL.md")
@@ -50,6 +67,10 @@ def discover_skill_roots(base: Path) -> list[Path]:
 
 
 def iter_corpus_files(skill_root: Path) -> list[Path]:
+    """枚举技能下参与建库的文本文件。
+
+    英文 README 与许可证不包含 AFSIM 知识，排除以减少检索噪声。
+    """
     files = []
     for p in skill_root.rglob("*"):
         if not p.is_file() or ".git" in p.parts or "__pycache__" in p.parts:
@@ -63,6 +84,7 @@ def iter_corpus_files(skill_root: Path) -> list[Path]:
 
 
 def classify_kind(skill_root: Path, path: Path) -> str:
+    """按相对路径判断片段类别，作为检索元数据。"""
     rel = path.relative_to(skill_root)
     if ".cursor" in rel.parts or ".trae" in rel.parts:
         return "command"
@@ -72,6 +94,7 @@ def classify_kind(skill_root: Path, path: Path) -> str:
 
 
 def _split_long(text: str, limit: int) -> list[str]:
+    """按行把超长文本切到 limit 以内，尽量不破坏语句。"""
     if len(text) <= limit:
         return [text]
     lines = text.splitlines()
@@ -88,6 +111,20 @@ def _split_long(text: str, limit: int) -> list[str]:
 
 
 def chunk_markdown(text: str, path: str, skill: str, kind: str) -> list[Chunk]:
+    """按标题层级切分 Markdown。
+
+    代码围栏内不识别标题也不按长度切分，否则会把一段示例拆成两半，
+    检索命中后无法直接复用。
+
+    Args:
+        text: Markdown 全文。
+        path: 相对技能根的路径。
+        skill: 技能名。
+        kind: 片段类别。
+
+    Returns:
+        带标题路径的片段列表。
+    """
     chunks: list[Chunk] = []
     headings: list[str] = []
     buffer: list[str] = []
@@ -95,6 +132,7 @@ def chunk_markdown(text: str, path: str, skill: str, kind: str) -> list[Chunk]:
     fence_marker = ""
 
     def flush():
+        """把当前缓冲区按标题路径输出为片段。"""
         nonlocal buffer
         body = "\n".join(buffer).strip()
         buffer = []
@@ -133,12 +171,27 @@ def chunk_markdown(text: str, path: str, skill: str, kind: str) -> list[Chunk]:
 
 
 def chunk_afsim_text(text: str, path: str, skill: str, kind: str) -> list[Chunk]:
+    """按 `命令 ... end_命令` 的完整块切分 AFSIM 文本。
+
+    块必须整体保留：平台、传感器、武器定义一旦被截断，检索到也无法
+    直接粘贴使用；块外散文再按长度合并。
+
+    Args:
+        text: AFSIM 文本全文。
+        path: 相对技能根的路径。
+        skill: 技能名。
+        kind: 片段类别。
+
+    Returns:
+        片段列表，块片段带块名。
+    """
     lines = text.splitlines()
     segments: list[tuple[str, str]] = []
     pending_comments: list[str] = []
     prose: list[str] = []
 
     def flush_prose():
+        """把块外散文按长度切分并输出。"""
         nonlocal prose
         body = "\n".join(prose).strip()
         prose = []
@@ -147,6 +200,7 @@ def chunk_afsim_text(text: str, path: str, skill: str, kind: str) -> list[Chunk]
                 segments.append((part, ""))
 
     def is_block_start(index: int) -> str | None:
+        """判断当前行是否为带匹配 end_ 的块起始行。"""
         token_match = TOKEN_RE.match(lines[index].strip())
         if not token_match or lines[index].lstrip().startswith("#"):
             return None
@@ -207,6 +261,7 @@ def chunk_afsim_text(text: str, path: str, skill: str, kind: str) -> list[Chunk]
 
 
 def chunk_file(skill_root: Path, path: Path) -> list[Chunk]:
+    """按扩展名选择策略切分单个文件。"""
     skill = skill_root.name
     kind = classify_kind(skill_root, path)
     rel = path.relative_to(skill_root).as_posix()
@@ -222,6 +277,7 @@ def chunk_file(skill_root: Path, path: Path) -> list[Chunk]:
 
 
 def chunk_skills(base: Path) -> list[Chunk]:
+    """切分 base 下所有技能语料。"""
     chunks: list[Chunk] = []
     for skill_root in discover_skill_roots(base):
         for path in iter_corpus_files(skill_root):

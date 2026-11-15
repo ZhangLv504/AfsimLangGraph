@@ -1,3 +1,5 @@
+"""LangGraph 图装配与运行入口。"""
+
 import uuid
 from datetime import datetime
 
@@ -10,6 +12,14 @@ from afsim_lg.graph.state import MainState
 
 
 def build_graph(checkpointer=None):
+    """装配生成、校验、验收与修复的条件边。
+
+    Args:
+        checkpointer: LangGraph 检查点存储；传 None 时不持久化。
+
+    Returns:
+        编译后的状态图。
+    """
     graph = StateGraph(MainState)
     graph.add_node("parse_requirement", nodes.parse_requirement)
     graph.add_node("retrieve", nodes.retrieve)
@@ -45,10 +55,21 @@ def build_graph(checkpointer=None):
 
 
 def new_run_id() -> str:
+    """生成按时间排序且不重复的运行标识。"""
     return f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
 
 
 def run(requirement: str, max_attempts: int = 2, run_id: str | None = None) -> dict:
+    """执行一次完整的生成-校验-验收流程。
+
+    Args:
+        requirement: 用户自然语言需求。
+        max_attempts: 最多生成几轮（含首轮）。
+        run_id: 指定运行标识；不传时自动生成。
+
+    Returns:
+        图执行结束时的状态。
+    """
     settings = get_settings()
     settings.checkpoints_db.parent.mkdir(parents=True, exist_ok=True)
     run_id = run_id or new_run_id()
@@ -61,6 +82,7 @@ def run(requirement: str, max_attempts: int = 2, run_id: str | None = None) -> d
     }
     with SqliteSaver.from_conn_string(str(settings.checkpoints_db)) as saver:
         graph = build_graph(saver)
+        # thread_id 直接用 run_id，便于按运行目录回放对应的检查点
         result = graph.invoke(
             initial, config={"configurable": {"thread_id": run_id}}
         )

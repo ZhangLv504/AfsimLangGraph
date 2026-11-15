@@ -1,3 +1,5 @@
+"""真实 mission.exe 的探测证据链集成测试。"""
+
 from pathlib import Path
 
 import pytest
@@ -55,6 +57,7 @@ end_time 120 sec
     not get_settings().mission_exe.is_file(), reason="mission.exe not installed"
 )
 def test_detection_evidence_pipeline(tmp_path: Path):
+    """雷达场景应产生探测事件，并通过全部确定性检查。"""
     (tmp_path / "output").mkdir()
     (tmp_path / "main.txt").write_text(SCENARIO, encoding="utf-8")
 

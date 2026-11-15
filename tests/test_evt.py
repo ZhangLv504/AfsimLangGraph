@@ -1,3 +1,5 @@
+"""evt 解析测试：时间格式、续行、阵营与交战事件。"""
+
 from pathlib import Path
 
 from afsim_lg.afsim.evt import parse_evt, time_to_seconds
@@ -19,12 +21,14 @@ FIXTURE = "\n".join(
 
 
 def test_time_to_seconds():
+    """两种时间戳写法都应得到相同的秒数语义。"""
     assert time_to_seconds("381.7") == 381.7
     assert time_to_seconds("00:02:10.0") == 130.0
     assert time_to_seconds("01:00:00") == 3600.0
 
 
 def test_parse_evt(tmp_path: Path):
+    """续行合并后应正确识别阵营、探测、发射与毁伤。"""
     path = tmp_path / "events.evt"
     path.write_text(FIXTURE, encoding="utf-8")
     summary = parse_evt(path)

@@ -1,3 +1,8 @@
+"""需求契约：把自然语言想定解析成可校验的结构。
+
+契约同时约束生成和验收：生成器按契约写工程，验收费按契约逐项检查。
+"""
+
 import json
 import re
 from typing import Literal
@@ -64,6 +69,8 @@ CONTRACT_SYSTEM = """你是 AFSIM 需求分析器。把用户想定拆成 JSON �
 
 
 class PlatformSpec(BaseModel):
+    """需求中一方平台的描述。"""
+
     side: str | None = None
     domain: Literal["air", "ground", "surface", "subsurface", "space", "unknown"] = "unknown"
     count: int = Field(default=1, ge=1)
@@ -74,12 +81,15 @@ class PlatformSpec(BaseModel):
     @field_validator("side", mode="before")
     @classmethod
     def normalize_side(cls, value):
+        """把中文或大小写混用的阵营归一化为英文枚举值。"""
         if value is None:
             return None
         return SIDE_MAP.get(str(value).strip().lower(), str(value).strip().lower())
 
 
 class Expectation(BaseModel):
+    """需求中明确要求的可观测事件。"""
+
     kind: Literal["detect", "fire", "hit", "kill"]
     actor_side: str | None = None
     target_side: str | None = None
@@ -88,17 +98,21 @@ class Expectation(BaseModel):
     @field_validator("kind", mode="before")
     @classmethod
     def normalize_kind(cls, value):
+        """把“探测/发射/命中/摧毁”等写法归一化为事件枚举。"""
         return KIND_MAP.get(str(value).strip().lower(), str(value).strip().lower())
 
     @field_validator("actor_side", "target_side", mode="before")
     @classmethod
     def normalize_side(cls, value):
+        """把事件参与方的中文阵营归一化为英文枚举值。"""
         if value is None:
             return None
         return SIDE_MAP.get(str(value).strip().lower(), str(value).strip().lower())
 
 
 class ScenarioContract(BaseModel):
+    """一次需求对应的完整验收契约。"""
+
     summary: str = ""
     duration_sec: float | None = Field(default=None, ge=0)
     platforms: list[PlatformSpec] = Field(default_factory=list)
@@ -107,14 +121,17 @@ class ScenarioContract(BaseModel):
 
     @property
     def expected_sides(self) -> set[str]:
+        """契约要求出现的所有阵营。"""
         return {p.side for p in self.platforms if p.side}
 
     @property
     def expected_platform_count(self) -> int:
+        """契约要求的最少平台实例数。"""
         return sum(p.count for p in self.platforms)
 
     @property
     def needs_event_evidence(self) -> bool:
+        """是否需要读取 evt 验证交战事件。"""
         return bool(self.expectations)
 
 
@@ -127,6 +144,14 @@ DURATION_FACTOR = {
 
 
 def guess_duration(requirement: str) -> float | None:
+    """从需求文本中猜测仿真时长，作为契约解析失败时的兜底。
+
+    Args:
+        requirement: 用户原始需求。
+
+    Returns:
+        换算成秒的时长；没有可识别的时长时返回 None。
+    """
     match = DURATION_RE.search(requirement)
     if not match:
         return None
@@ -134,6 +159,15 @@ def guess_duration(requirement: str) -> float | None:
 
 
 def fallback_contract(requirement: str, error: str) -> ScenarioContract:
+    """构造降级契约：只保留可正则提取的时长。
+
+    Args:
+        requirement: 用户原始需求。
+        error: 触发降级的原因，写入 notes 便于回溯。
+
+    Returns:
+        平台与事件为空的契约。
+    """
     return ScenarioContract(
         summary=requirement.strip()[:200],
         duration_sec=guess_duration(requirement),
@@ -142,6 +176,14 @@ def fallback_contract(requirement: str, error: str) -> ScenarioContract:
 
 
 def parse_contract(requirement: str) -> tuple[ScenarioContract, str]:
+    """调用模型把需求解析成契约，失败时重试一次再降级。
+
+    Args:
+        requirement: 用户原始需求。
+
+    Returns:
+        契约对象与错误信息；成功时错误为空字符串。
+    """
     prompt = f"【用户想定】\n{requirement}"
     error = ""
     for _ in range(2):

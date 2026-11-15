@@ -1,3 +1,5 @@
+"""把契约与运行结果对照成可复现的检查项。"""
+
 import re
 
 from afsim_lg.afsim.evt import EvtSummary
@@ -26,6 +28,14 @@ def _check(name: str, ok: bool, detail: str) -> dict:
 
 
 def parse_end_time(files_text: str) -> tuple[float, str] | None:
+    """从工程文本中读取 end_time 并换算成秒。
+
+    Args:
+        files_text: 生成文件的全部文本拼接。
+
+    Returns:
+        秒数与原始行；没有 end_time 时返回 None。
+    """
     for match in END_TIME_RE.finditer(files_text):
         factor = TIME_FACTORS.get(match.group(2).lower())
         if factor:
@@ -38,6 +48,7 @@ def _side_of(evt: EvtSummary, name: str) -> str:
 
 
 def _match_side(evt: EvtSummary, name: str, expected: str | None) -> bool:
+    # 严格比较阵营：平台名只做精确匹配，未知阵营不会被视为“任意方”
     return expected is None or _side_of(evt, name) == expected.lower()
 
 
@@ -74,6 +85,16 @@ def evaluate(
     files_text: str,
     evt: EvtSummary | None,
 ) -> tuple[list[dict], dict]:
+    """按契约生成确定性检查项并汇总运行证据。
+
+    Args:
+        contract: 需求契约。
+        files_text: 生成文件全部文本，用于读 end_time 和声明。
+        evt: 解析后的事件摘要；没有 evt 时传 None。
+
+    Returns:
+        检查项列表与精简后的证据字典。
+    """
     checks: list[dict] = []
 
     if contract.duration_sec is not None:
@@ -85,6 +106,7 @@ def evaluate(
             checks.append(
                 _check(
                     "仿真时长",
+                    # 留 0.5 秒容差，吸收浮点输出与单位换算误差
                     actual + 0.5 >= contract.duration_sec,
                     f"要求 {contract.duration_sec:g}s，实际 {actual:g}s（{line}）",
                 )
