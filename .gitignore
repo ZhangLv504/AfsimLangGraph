@@ -1,0 +1,10 @@
+﻿afsim2.9en/
+afsim-tools/
+data/
+workspace/
+.idea/
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+/mission.log
