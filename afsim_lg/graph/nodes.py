@@ -13,7 +13,11 @@ from afsim_lg.contract import ScenarioContract, parse_contract
 from afsim_lg.graph.checks import evaluate
 from afsim_lg.graph.state import MainState
 from afsim_lg.llm import chat
-from afsim_lg.rag.errors import extract_error_keywords, search_error_refs
+from afsim_lg.rag.errors import (
+    extract_error_keywords,
+    search_error_refs,
+    search_error_skill,
+)
 from afsim_lg.rag.index import search
 
 FILE_MARK_RE = re.compile(r"^===FILE:\s*(.+?)\s*===$")
@@ -23,8 +27,13 @@ FENCE_RE = re.compile(r"^(```|~~~)")
 MAX_FILES = 12
 CORPUS_CHARS = 1400
 MAIN_CHARS = 4000
+# Undefined X 只报名字，不报位置；单独转成“补定义块”的指令，7B 才会照做
+UNDEFINED_ERROR_RE = re.compile(r"Undefined\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
 # 定向修复时每个文件的展示上限：只看错误附近，避免整份工程撑爆上下文
 REPAIR_FILE_CHARS = 3000
+# 修复轮还要塞工程正文，重检索片段只取前几条、每条截得更短
+REPAIR_CORPUS_HITS = 4
+REPAIR_CORPUS_CHARS = 700
 
 # 注入的事件块包含 PLATFORM_ADDED：没有它，evt 里就没有平台阵营，无法按阵营验收
 EVENT_OUTPUT_STANZA = """event_output
@@ -89,7 +98,7 @@ REPAIR_SYSTEM = """你是 AFSIM 2.9.0 场景修复器。根据错误反馈与当
 1. 只输出必须改动的文件；没有输出的文件，系统会保留原样。
 2. 每个输出文件必须给出完整内容，不能只给片段或 diff。
 3. 保留当前工程中已经正确的部分，把改动限制在错误相关的最小范围。
-4. platform 引用的 platform_type 必须有定义；每个块用对应的 end_ 闭合。
+4. platform 引用的 platform_type，以及 platform_type 里的 sensor/weapon/mover/radar_signature 等引用，必须在文件集中有定义；报 Undefined X 时补 X 的定义块，不要只改无关参数。
 5. 注释必须独立成行；不要使用 thread_count。
 6. 错误信息不足以判断时，宁可原样输出当前文件，也不要新增未定义的类型或命令。"""
 
@@ -119,14 +128,16 @@ def _write_json(path: Path, payload) -> None:
     )
 
 
-def _corpus_block(hits: list[dict]) -> str:
+def _corpus_block(
+    hits: list[dict], chars: int = CORPUS_CHARS, limit: int | None = None
+) -> str:
     """把检索命中拼成给模型的参考片段。"""
     parts = []
-    for i, hit in enumerate(hits, 1):
+    for i, hit in enumerate(hits[:limit], 1):
         meta = hit["metadata"]
         parts.append(
             f"[{i}] {meta['skill']}/{meta['path']} (kind={meta['kind']})\n"
-            f"{hit['document'][:CORPUS_CHARS]}"
+            f"{hit['document'][:chars]}"
         )
     return "\n\n".join(parts)
 
@@ -278,11 +289,19 @@ def _repair_files(state: MainState) -> dict[str, str]:
         f"===FILE: {name}===\n{content[:REPAIR_FILE_CHARS]}"
         for name, content in state.get("files", {}).items()
     ]
-    prompt = "\n\n".join(
-        _common_parts(state)
-        + ["【当前工程】\n" + "\n\n".join(blocks), "只输出需要修改的文件。"]
-    )
-    return parse_files(chat(REPAIR_SYSTEM, prompt))
+    parts = _common_parts(state) + ["【当前工程】\n" + "\n\n".join(blocks)]
+    if state.get("retrieved"):
+        # 修复轮优先看按错误重检索到的语法/模板，只取最相关的几条
+        parts.append(
+            "【报错重检索片段】\n"
+            + _corpus_block(
+                state["retrieved"],
+                chars=REPAIR_CORPUS_CHARS,
+                limit=REPAIR_CORPUS_HITS,
+            )
+        )
+    parts.append("只输出需要修改的文件。")
+    return parse_files(chat(REPAIR_SYSTEM, "\n\n".join(parts)))
 
 
 def generate(state: MainState) -> dict:
@@ -350,6 +369,7 @@ def write_files(state: MainState) -> dict:
                 "path": hit["metadata"]["path"],
                 "kind": hit["metadata"]["kind"],
                 "distance": hit["distance"],
+                "origin": hit.get("origin", "requirement"),
                 "document": hit["document"],
             }
             for hit in state.get("retrieved", [])
@@ -500,6 +520,43 @@ def assess(state: MainState) -> dict:
     }
 
 
+def _undefined_hint(errors: list[str]) -> str:
+    """把 Undefined 报错转成“补定义块”的明确指令。"""
+    names = sorted(
+        {
+            match.group(1)
+            for error in errors
+            if (match := UNDEFINED_ERROR_RE.search(error))
+        }
+    )
+    if not names:
+        return ""
+    return (
+        "缺少定义：" + "、".join(names) + "。引用处保留，补上对应定义块；例如签名：\n"
+        "radar_signature <名字> WSF_RADAR_SIGNATURE\n"
+        "   constant 10 m^2\n"
+        "end_radar_signature"
+    )
+
+
+def _merge_retrieved(
+    error_hits: list[dict], old_hits: list[dict], limit: int = 8
+) -> list[dict]:
+    """错误检索结果优先，再补首轮需求检索；按技能/路径/块去重。"""
+    merged: list[dict] = []
+    seen: set[tuple] = set()
+    for hit in error_hits + old_hits:
+        meta = hit["metadata"]
+        key = (meta["skill"], meta["path"], meta.get("chunk_index"))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(hit)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
 def fix(state: MainState) -> dict:
     """汇总本轮错误与验收缺口，检索对应教训，作为下一轮生成的反馈。"""
     assessment = state.get("assessment", {})
@@ -522,6 +579,9 @@ def fix(state: MainState) -> dict:
         # 静态检查失败时引擎没有启动，标注清楚避免模型当成运行期错误去猜
         label = "静态检查错误" if mission.get("static_failed") else "mission.exe 报错"
         parts.append(f"{label}：\n" + "\n".join(mission["errors"]))
+    undefined_hint = _undefined_hint(mission.get("errors", []))
+    if undefined_hint:
+        parts.append(undefined_hint)
     if assessment.get("missing"):
         parts.append("需求缺失：\n" + "\n".join(assessment["missing"]))
     if assessment.get("fix_hint"):
@@ -530,6 +590,17 @@ def fix(state: MainState) -> dict:
 
     keywords = extract_error_keywords(mission.get("errors", []))
     refs = search_error_refs(keywords)
+    # 首轮只按需求检索；修复轮再按报错关键词查语法/模板，结果排在前面
+    error_hits = [
+        {**hit, "origin": "error"}
+        for hit in search_error_skill(state.get("requirement", ""), keywords)
+    ]
+    retrieved = state.get("retrieved", [])
+    if error_hits:
+        old_hits = [
+            {**hit, "origin": hit.get("origin", "requirement")} for hit in retrieved
+        ]
+        retrieved = _merge_retrieved(error_hits, old_hits)
     _write_json(
         failed_dir / "fix.json",
         {
@@ -539,6 +610,17 @@ def fix(state: MainState) -> dict:
                 {"keyword": hit["keyword"], **hit["metadata"], "document": hit["document"]}
                 for hit in refs
             ],
+            "retrieved": [
+                {
+                    "skill": hit["metadata"]["skill"],
+                    "path": hit["metadata"]["path"],
+                    "kind": hit["metadata"]["kind"],
+                    "chunk_index": hit["metadata"].get("chunk_index", 0),
+                    "origin": hit.get("origin", ""),
+                    "distance": hit.get("distance"),
+                }
+                for hit in retrieved
+            ],
         },
     )
     return {
@@ -546,6 +628,7 @@ def fix(state: MainState) -> dict:
         "feedback": feedback,
         "error_keywords": keywords,
         "error_refs": refs,
+        "retrieved": retrieved,
     }
 
 

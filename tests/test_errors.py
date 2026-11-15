@@ -2,7 +2,11 @@
 
 import pytest
 
-from afsim_lg.rag.errors import extract_error_keywords, search_error_refs
+from afsim_lg.rag.errors import (
+    extract_error_keywords,
+    search_error_refs,
+    search_error_skill,
+)
 from afsim_lg.rag.index import get_collection
 
 
@@ -50,3 +54,14 @@ def test_search_returns_ref_or_lesson(require_index):
     assert hits
     assert all(h["metadata"]["kind"] in {"ref", "lesson"} for h in hits)
     assert all(h["keyword"] == "Mover not closed" for h in hits)
+
+
+def test_search_error_skill_returns_syntax_blocks(require_index):
+    """按错误重检索应返回语法/模板类块，并保留距离字段。"""
+    hits = search_error_skill("飞机平飞", ["Undefined radar_signature"])
+    assert hits
+    assert all(
+        h["metadata"]["kind"] in {"block", "template", "command", "reference"}
+        for h in hits
+    )
+    assert all("distance" in h for h in hits)

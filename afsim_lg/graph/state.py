@@ -23,6 +23,7 @@ class MainState(TypedDict, total=False):
     error_refs: list[dict]
     contract: dict
     contract_error: str
+    # 修复轮会把按错误重检索的块排到前面，origin 标记来源
     retrieved: list[dict]
     # 文件正文也放进状态供验收拼接，但完整副本已落盘到 attempt_dir
     files: dict[str, str]

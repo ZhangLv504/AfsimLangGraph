@@ -55,13 +55,26 @@ def test_generate_repairs_only_returned_files(monkeypatch):
         "requirement": "测试需求",
         "files": {"main.txt": "old main", "setup.txt": "keep setup"},
         "feedback": "mission.exe 报错：Unknown command",
-        "retrieved": [],
+        "retrieved": [
+            {
+                "document": "radar_signature example",
+                "distance": 0.1,
+                "metadata": {
+                    "skill": "afsim-skill",
+                    "path": "templates/signature.txt",
+                    "kind": "template",
+                    "chunk_index": 0,
+                },
+            }
+        ],
     }
     result = nodes.generate(state)
     assert result["generation_mode"] == "repair"
     assert result["files"]["setup.txt"] == "keep setup"
     assert "platform_type FOO" in result["files"]["main.txt"]
     assert nodes.REPAIR_SYSTEM in calls[0][0]
+    assert "【报错重检索片段】" in calls[0][1]
+    assert "radar_signature example" in calls[0][1]
 
 
 def test_generate_falls_back_to_full_when_repair_unparsable(monkeypatch):
@@ -83,6 +96,42 @@ def test_generate_falls_back_to_full_when_repair_unparsable(monkeypatch):
     result = nodes.generate(state)
     assert result["generation_mode"] == "full"
     assert result["files"]["main.txt"].strip() == "end_time 10 sec"
+
+
+def test_undefined_hint_names_missing_object():
+    """Undefined 报错应转成补定义块的具体指令。"""
+    hint = nodes._undefined_hint(
+        ["ERROR: Undefined radar_signature.", "ERROR: Undefined optical_signature."]
+    )
+    assert "radar_signature" in hint
+    assert "optical_signature" in hint
+    assert "WSF_RADAR_SIGNATURE" in hint
+    assert nodes._undefined_hint(["Unknown command: foo"]) == ""
+
+
+def test_merge_retrieved_prefers_error_hits():
+    """合并时错误检索在前，重复块只保留一份。"""
+    def hit(path, index, origin):
+        """构造一条最小检索命中。"""
+        return {
+            "document": "x",
+            "distance": 0.1,
+            "origin": origin,
+            "metadata": {
+                "skill": "afsim-skill",
+                "path": path,
+                "kind": "block",
+                "chunk_index": index,
+            },
+        }
+
+    merged = nodes._merge_retrieved(
+        [hit("same.txt", 1, "error")],
+        [hit("same.txt", 1, "requirement"), hit("other.txt", 2, "requirement")],
+    )
+    assert [h["metadata"]["path"] for h in merged] == ["same.txt", "other.txt"]
+    assert merged[0]["origin"] == "error"
+    assert merged[1]["origin"] == "requirement"
 
 
 def test_validate_skips_mission_on_static_error(tmp_path, monkeypatch):

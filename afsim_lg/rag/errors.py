@@ -7,9 +7,12 @@
 import re
 from typing import Callable
 
-from afsim_lg.rag.index import get_collection
+from afsim_lg.rag.index import get_collection, search
 
 ERROR_KINDS = ["ref", "lesson"]
+# 重检索只取语法/模板类块；命令文档与参考也可能有用，但排在后面
+SKILL_KINDS = ["block", "template", "reference", "command"]
+KIND_PRIORITY = {"block": 0, "template": 0, "reference": 1, "command": 2}
 MAX_KEYWORDS = 8
 MAX_REFS = 4
 # 每个关键词在每个类别下最多取几条，让 ref 与 lesson 都有机会进入结果
@@ -79,6 +82,32 @@ def extract_error_keywords(errors: list[str]) -> list[str]:
         if len(keywords) >= MAX_KEYWORDS:
             break
     return keywords[:MAX_KEYWORDS]
+
+
+def search_error_skill(
+    requirement: str, keywords: list[str], k: int = 6
+) -> list[dict]:
+    """用需求与报错关键词重查技能语料。
+
+    首轮只按需求检索，修复轮需要的是报错对象的语法/模板；两者拼成一条
+    查询，既保留需求上下文，又让错误词决定命中方向。
+
+    Args:
+        requirement: 用户原始需求。
+        keywords: `extract_error_keywords` 的结果。
+        k: 返回条数。
+
+    Returns:
+        命中列表，结构与 `index.search` 一致，含 distance。
+    """
+    if not keywords:
+        return []
+    query = "\n".join([requirement, " ".join(keywords)]).strip()
+    # 多取一些再按类别重排：修复最需要 block/template 里的可复用语法，
+    # 命令类文档（如 .cursor/commands）距离可能更近，但对改代码帮助小
+    hits = search(query, k=k * 2, where={"kind": {"$in": SKILL_KINDS}})
+    hits.sort(key=lambda hit: (KIND_PRIORITY.get(hit["metadata"]["kind"], 9), hit["distance"]))
+    return hits[:k]
 
 
 def search_error_refs(keywords: list[str], k: int = MAX_REFS) -> list[dict]:
