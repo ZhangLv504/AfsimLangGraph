@@ -173,6 +173,87 @@ def test_bad_value_hint_mentions_all_references():
     assert nodes._bad_value_hint(["Unknown command: foo"]) == ""
 
 
+def test_bad_value_hint_constant_requires_value():
+    """constant 缺值时应给出带单位的示例。"""
+    hint = nodes._bad_value_hint(["ERROR: Bad value for: constant @ 'main.txt', line 85"])
+    assert "数值和单位" in hint
+    assert "constant 10 m^2" in hint
+    assert "antenna_pattern" not in hint
+
+
+def test_unknown_command_hint_handles_blocks_and_end_markers():
+    """普通未知命令提示整块处理，end_ 提示补闭合。"""
+    hint = nodes._unknown_command_hint(
+        [
+            "Unknown command: red_radar_sensor @ 'main.txt', line 69",
+            "Unknown command: end_platform_type @ 'main.txt', line 5",
+        ]
+    )
+    assert "整块" in hint
+    assert "补全缺失的 end_" in hint
+    assert nodes._unknown_command_hint([]) == ""
+
+
+def test_unknown_command_hint_handles_antenna_base_type():
+    """WSF_ANTENNA_PATTERN 不是基类型，提示按子块语法重写。"""
+    hint = nodes._unknown_command_hint(
+        ["Unknown command: WSF_ANTENNA_PATTERN @ 'main.txt', line 30"]
+    )
+    assert "不是 antenna_pattern 的基类型" in hint
+    assert "circular_pattern" in hint
+
+
+def test_constant_hint_distinguishes_units():
+    """constant 单位错误要区分方向图与签名。"""
+    hint = nodes._constant_hint(
+        ["ERROR: constant: table units must be 'db' or 'absolute' @ 'main.txt', line 84"]
+    )
+    assert "antenna_pattern" in hint and "constant 0 db" in hint
+    assert "radar_signature" in hint and "constant 10 m^2" in hint
+    assert nodes._constant_hint(["ERROR: Undefined radar_signature."]) == ""
+
+
+def test_detect_hint_only_for_detection_failures():
+    """只有 detect 失败才提示传感器归属与距离。"""
+    hint = nodes._detect_hint(["事件:detect: red→blue 要求≥1，evt 实际 0"])
+    assert "platform_type" in hint
+    assert "one_m2_detect_range" in hint
+    assert nodes._detect_hint(["仿真时长: 不足"]) == ""
+
+
+def test_signature_hint_names_undefined_reference():
+    """只提示被引用但未定义的签名，已定义的不要点名。"""
+    files = {
+        "main.txt": (
+            "radar_signature GOOD_SIG\n"
+            "   constant 1 m^2\n"
+            "end_radar_signature\n"
+            "platform_type FOO WSF_PLATFORM\n"
+            "   radar_signature GOOD_SIG\n"
+            "   radar_signature MISSING_SIG\n"
+            "end_platform_type\n"
+        )
+    }
+    hint = nodes._signature_hint(files)
+    assert "MISSING_SIG" in hint
+    assert "GOOD_SIG" not in hint
+
+
+def test_signature_hint_empty_when_all_defined():
+    """全部有定义时不产生提示。"""
+    files = {
+        "main.txt": (
+            "radar_signature SIG WSF_RADAR_SIGNATURE\n"
+            "   constant 1 m^2\n"
+            "end_radar_signature\n"
+            "platform_type FOO WSF_PLATFORM\n"
+            "   radar_signature SIG\n"
+            "end_platform_type\n"
+        )
+    }
+    assert nodes._signature_hint(files) == ""
+
+
 def test_merge_retrieved_prefers_error_hits():
     """合并时错误检索在前，重复块只保留一份。"""
     def hit(path, index, origin):

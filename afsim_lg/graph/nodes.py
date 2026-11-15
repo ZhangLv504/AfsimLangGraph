@@ -31,6 +31,23 @@ MAIN_CHARS = 4000
 UNDEFINED_ERROR_RE = re.compile(r"Undefined\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
 # antenna_pattern 等命令的 Bad value 通常是引用了不存在的定义
 BAD_VALUE_ERROR_RE = re.compile(r"Bad value for:\s*([A-Za-z_][A-Za-z0-9_]*)", re.I)
+UNKNOWN_COMMAND_RE = re.compile(r"Unknown command:\s*([A-Za-z_][A-Za-z0-9_]*)", re.I)
+# constant 在 antenna_pattern 里只接受 db/absolute，在签名里用 m^2
+CONSTANT_UNITS_ERROR_RE = re.compile(
+    r"constant:.*units must be '?db'? or '?absolute'?", re.I
+)
+SIGNATURE_LINE_RE = re.compile(r"^\s*radar_signature\s+([A-Za-z_][A-Za-z0-9_]*)(.*)$", re.I)
+SIGNATURE_BODY_TOKENS = {
+    "constant",
+    "state",
+    "inline_table",
+    "table",
+    "file",
+    "spectrum_data",
+    "data_reference_range",
+    "frequency_maximum_rcs_table",
+    "frequency_minimum_rcs_table",
+}
 # 定向修复时每个文件的展示上限：只看错误附近，避免整份工程撑爆上下文
 REPAIR_FILE_CHARS = 3000
 # 修复轮还要塞工程正文，重检索片段只取前几条、每条截得更短
@@ -90,7 +107,64 @@ event_output
    enable WEAPON_FIRED
    enable WEAPON_HIT
    enable PLATFORM_BROKEN
-end_event_output"""
+end_event_output
+
+11. 引用 antenna_pattern 时必须有同名的 `antenna_pattern <名字> ... end_antenna_pattern` 定义块，名字逐字一致。
+12. antenna_pattern 定义写成 `antenna_pattern <名字>`，不要带基类型；方向图用 `constant` 或 `circular_pattern/rectangular_pattern` 子块，不要用 pattern_type/radius。
+13. radar_signature 的 constant 用面积单位（如 `constant 10 m^2`）；antenna_pattern 的 constant 用 db 或 absolute（如 `constant 0 db`）。
+14. sensor 必须定义在对应平台的 platform_type 内，不要写成顶层全局 sensor；确保 platform 实例能继承到它。
+
+已验证的最小雷达骨架（结构可复用，名字按需求替换）：
+antenna_pattern SEARCH_ANTENNA
+   constant 0 db
+end_antenna_pattern
+
+radar_signature TARGET_SIGNATURE
+   constant 10 m^2
+end_radar_signature
+
+platform_type RED_RADAR WSF_PLATFORM
+   side red
+   spatial_domain land
+   sensor search WSF_RADAR_SENSOR
+      frame_time 1 sec
+      one_m2_detect_range 50 nm
+      ignore_same_side
+      on
+      transmitter
+         antenna_pattern SEARCH_ANTENNA
+         power 500 kw
+         frequency 9000 mhz
+         pulse_width 1.0 usec
+         pulse_repetition_interval 350 usec
+      end_transmitter
+      receiver
+         antenna_pattern SEARCH_ANTENNA
+         bandwidth 1.0 mhz
+      end_receiver
+   end_sensor
+end_platform_type
+
+platform_type BLUE_PLANE WSF_PLATFORM
+   side blue
+   spatial_domain air
+   radar_signature TARGET_SIGNATURE
+   mover WSF_AIR_MOVER
+   end_mover
+end_platform_type
+
+platform red_radar RED_RADAR
+   side red
+   position 30:00:00n 120:00:00e altitude 0 ft msl
+end_platform
+
+platform blue_plane BLUE_PLANE
+   side blue
+   route
+      position 30:10:00n 120:00:00e altitude 10000 ft msl
+      speed 300 kts
+   end_route
+end_platform"""
 
 JUDGE_SYSTEM = """你是 AFSIM 场景验收员。对照用户需求与需求契约检查生成的工程，只输出 JSON：
 {"passed": true 或 false, "missing": ["缺失或错误的点"], "fix_hint": "下一轮如何修改"}
@@ -119,7 +193,11 @@ REPAIR_SYSTEM = """你是 AFSIM 2.9.0 场景修复器。根据错误反馈与当
 5. 注释必须独立成行；不要使用 thread_count。
 6. 错误信息不足以判断时，宁可原样输出当前文件，也不要新增未定义的类型或命令。
 7. 保留当前工程里的 event_pipe / event_output 块及其 enable，不要删除。
-8. 报 Bad value for: antenna_pattern 时，所有 antenna_pattern 引用都必须有同名定义块，不要只改其中一处。"""
+8. 报 Bad value for: antenna_pattern 时，所有 antenna_pattern 引用都必须有同名定义块，不要只改其中一处。
+9. 报 Unknown command: X 时，X 不是 end_ 就检查以它开头的整块（拼写错误改正，否则整块删除）；X 是 end_ 说明前面有块未闭合，补缺失的 end_。
+10. 报 Unknown command: WSF_ANTENNA_PATTERN 时，删除该基类型，按 `antenna_pattern <名字>` + constant/circular_pattern/rectangular_pattern 子块重写。
+11. sensor 要放进探测平台的 platform_type 内；不要删除已有平台，也不要只保留顶层 sensor。
+12. antenna_pattern 的 constant 用 db 或 absolute（如 constant 0 db）；radar_signature 的 constant 用 m^2（如 constant 10 m^2）。"""
 
 
 def _run_dir(state: MainState) -> Path:
@@ -684,15 +762,118 @@ def _bad_value_hint(errors: list[str]) -> str:
     )
     if not names:
         return ""
+    specifics: list[str] = []
+    if any(name.lower() == "constant" for name in names):
+        specifics.append(
+            "constant 必须带数值和单位，例如 `constant 10 m^2`（签名）或 "
+            "`constant 0 db`（方向图），不能只写 constant。"
+        )
+    if any(name.lower() == "antenna_pattern" for name in names):
+        specifics.append(
+            "antenna_pattern 的每一处引用都必须有同名定义块；定义写成 "
+            "`antenna_pattern <名字>` 后接 constant/circular_pattern/rectangular_pattern 子块。"
+        )
+    if not specifics:
+        specifics.append("检查该命令的每一处引用与参数是否有效。")
+    return "参数取值错误：" + "、".join(names) + "。\n" + "\n".join(specifics)
+
+
+def _unknown_command_hint(errors: list[str]) -> str:
+    """把 Unknown command 报错转成删除/改写或补闭合的指令。"""
+    names = sorted(
+        {
+            match.group(1)
+            for error in errors
+            if (match := UNKNOWN_COMMAND_RE.search(error))
+        }
+    )
+    if not names:
+        return ""
+    lines = []
+    for name in names:
+        if name.upper() == "WSF_ANTENNA_PATTERN":
+            lines.append(
+                "WSF_ANTENNA_PATTERN 不是 antenna_pattern 的基类型：定义写成 "
+                "`antenna_pattern <名字>`，后接 constant/circular_pattern/rectangular_pattern "
+                "子块；删除 pattern_type、radius 这类不存在的参数。"
+            )
+        elif name.lower().startswith("end_"):
+            lines.append(
+                f"{name} 是闭合标记：前面有同名块未闭合或缺少对应块；"
+                "补全缺失的 end_，删除多余的闭合标记。"
+            )
+        else:
+            lines.append(
+                f"{name} 不是有效命令：检查以它开头到 end_{name} 的整块，"
+                "拼写错误就改成正确命令，否则整块删除。"
+            )
+    return "未知命令处理：\n" + "\n".join(lines)
+
+
+def _signature_hint(files: dict[str, str]) -> str:
+    """找出被引用但没有定义的 radar_signature，给出精确补定义指令。
+
+    AFSIM 的 `Undefined radar_signature` 不报具体名字；这里按“下一行是签名
+    子命令/end_radar_signature 即定义，否则是 platform_type 内引用”判断。
+    """
+    lines = "\n\n".join(files.values()).splitlines()
+    defined: set[str] = set()
+    references: list[str] = []
+
+    for index, line in enumerate(lines):
+        match = SIGNATURE_LINE_RE.match(line)
+        if not match:
+            continue
+        name, rest = match.group(1), match.group(2).strip()
+        # 带基类型（如 WSF_RADAR_SIGNATURE）的一律是定义
+        if rest:
+            defined.add(name.lower())
+            continue
+        is_definition = False
+        for later in lines[index + 1 :]:
+            text = later.strip()
+            if not text or text.startswith(("#", "//")):
+                continue
+            token = text.split()[0].lower()
+            if token == "end_radar_signature" or token in SIGNATURE_BODY_TOKENS:
+                is_definition = True
+            break
+        if is_definition:
+            defined.add(name.lower())
+        else:
+            references.append(name)
+
+    missing = sorted({name for name in references if name.lower() not in defined})
+    if not missing:
+        return ""
     return (
-        "参数取值错误：" + "、".join(names) + "。检查该命令的每一处引用是否都有同名定义块；"
-        "以 antenna_pattern 为例，引用处需要工程里存在：\n"
-        "antenna_pattern <名字>\n"
-        "   rectangular_pattern\n"
-        "      azimuth_beamwidth 2 deg\n"
-        "      elevation_beamwidth 2 deg\n"
-        "   end_rectangular_pattern\n"
-        "end_antenna_pattern"
+        "缺少定义的 radar_signature：" + "、".join(missing) + "。补成：\n"
+        "radar_signature <名字>\n"
+        "   constant 1 m^2\n"
+        "end_radar_signature"
+    )
+
+
+def _constant_hint(errors: list[str]) -> str:
+    """constant 单位错误时明确区分方向图与签名。"""
+    if not any(CONSTANT_UNITS_ERROR_RE.search(error) for error in errors):
+        return ""
+    return (
+        "antenna_pattern 的 constant 用 db 或 absolute（如 constant 0 db）；"
+        "radar_signature 的 constant 用面积单位（如 constant 10 m^2）。"
+    )
+
+
+def _detect_hint(missing: list[str]) -> str:
+    """detect 事件未发生时给出归属与距离排查指令。"""
+    if not any("detect" in item.lower() or "探测" in item for item in missing):
+        return ""
+    return (
+        "detect 事件未发生：不要删除已有平台。检查：\n"
+        "1) sensor 是否定义在探测平台的 platform_type 内，并被 platform 实例化；\n"
+        "2) sensor 是否有 on 与 ignore_same_side；\n"
+        "3) one_m2_detect_range / maximum_range 是否覆盖双方距离；\n"
+        "4) 双方 position/route 是否在探测范围内。"
     )
 
 
@@ -742,6 +923,18 @@ def fix(state: MainState) -> dict:
     bad_value_hint = _bad_value_hint(mission.get("errors", []))
     if bad_value_hint:
         parts.append(bad_value_hint)
+    unknown_hint = _unknown_command_hint(mission.get("errors", []))
+    if unknown_hint:
+        parts.append(unknown_hint)
+    signature_hint = _signature_hint(state.get("files", {}))
+    if signature_hint:
+        parts.append(signature_hint)
+    detect_hint = _detect_hint(assessment.get("missing", []))
+    if detect_hint:
+        parts.append(detect_hint)
+    constant_hint = _constant_hint(mission.get("errors", []))
+    if constant_hint:
+        parts.append(constant_hint)
     if assessment.get("missing"):
         parts.append("需求缺失：\n" + "\n".join(assessment["missing"]))
     if assessment.get("fix_hint"):
