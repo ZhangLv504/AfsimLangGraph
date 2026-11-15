@@ -35,16 +35,23 @@ REPAIR_FILE_CHARS = 3000
 REPAIR_CORPUS_HITS = 4
 REPAIR_CORPUS_CHARS = 700
 
-# 注入的事件块包含 PLATFORM_ADDED：没有它，evt 里就没有平台阵营，无法按阵营验收
-EVENT_OUTPUT_STANZA = """event_output
-   file output/events.evt
-   enable PLATFORM_ADDED
-   enable SENSOR_TRACK_INITIATED
-   enable WEAPON_FIRED
-   enable WEAPON_HIT
-   enable PLATFORM_BROKEN
-end_event_output
-"""
+# 输出块是留痕与验收的基础：event_output 供 evt 验收，event_pipe 供事件管道
+OUTPUT_SPECS = {
+    "event_pipe": (
+        "output/events.aer",
+        ["AIRCOMBAT", "TRACK_UPDATE", "BEHAVIOR_TOOL"],
+    ),
+    "event_output": (
+        "output/events.evt",
+        [
+            "PLATFORM_ADDED",
+            "SENSOR_TRACK_INITIATED",
+            "WEAPON_FIRED",
+            "WEAPON_HIT",
+            "PLATFORM_BROKEN",
+        ],
+    ),
+}
 
 GENERATOR_SYSTEM = """你是 AFSIM 2.9.0 场景生成器。根据用户需求、需求契约与检索到的技能片段，输出可编译的 AFSIM 工程文件。
 
@@ -66,7 +73,14 @@ GENERATOR_SYSTEM = """你是 AFSIM 2.9.0 场景生成器。根据用户需求、
 7. 优先复用检索片段中已验证的写法，不要自造命令。
 8. 必须显式写 end_time，且不小于契约要求的时长。
 9. 检索片段只是参考，不要把片段里的类型名（platform_type / sensor / weapon / antenna_pattern 等）直接引用到工程，除非你在同一份输出中完整定义了它；所有引用必须先定义后使用。
-10. 契约 expectations 非空时，必须包含事件输出块：
+10. 必须包含以下两个输出块，enable 不能少（系统也会补齐缺失项）：
+event_pipe
+   file output/events.aer
+   enable AIRCOMBAT
+   enable TRACK_UPDATE
+   enable BEHAVIOR_TOOL
+end_event_pipe
+
 event_output
    file output/events.evt
    enable PLATFORM_ADDED
@@ -100,7 +114,8 @@ REPAIR_SYSTEM = """你是 AFSIM 2.9.0 场景修复器。根据错误反馈与当
 3. 保留当前工程中已经正确的部分，把改动限制在错误相关的最小范围。
 4. platform 引用的 platform_type，以及 platform_type 里的 sensor/weapon/mover/radar_signature 等引用，必须在文件集中有定义；报 Undefined X 时补 X 的定义块，不要只改无关参数。
 5. 注释必须独立成行；不要使用 thread_count。
-6. 错误信息不足以判断时，宁可原样输出当前文件，也不要新增未定义的类型或命令。"""
+6. 错误信息不足以判断时，宁可原样输出当前文件，也不要新增未定义的类型或命令。
+7. 保留当前工程里的 event_pipe / event_output 块及其 enable，不要删除。"""
 
 
 def _run_dir(state: MainState) -> Path:
@@ -207,28 +222,137 @@ def _safe_path(run_dir: Path, name: str) -> Path | None:
     return target
 
 
-def _ensure_event_output(files: dict[str, str], contract: ScenarioContract) -> tuple[dict, bool]:
-    """契约要求事件但工程没写 event_output 时补一段标准配置。
+def _complete_output_block(
+    text: str, command: str, default_file: str, enables: list[str]
+) -> tuple[str, bool]:
+    """补全一个输出块的 file 与 enable；块不存在时追加标准块。
 
-    只在完全缺失时注入；模型已写 event_output 就不改，避免覆盖它自定义的
-    事件选择。
+    单行块（`event_output file NULL end_event_output`）会展开成多行；
+    未闭合的块不在文本层改，交给静态/运行检查。
+
+    Args:
+        text: 文件全文。
+        command: `event_pipe` 或 `event_output`。
+        default_file: 缺 file 或 file 为 NULL 时使用的输出路径。
+        enables: 必须存在的 enable 项。
+
+    Returns:
+        处理后的文本与是否发生修改。
+    """
+    lines = text.splitlines()
+    start = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if line.strip() == command or line.strip().startswith(command + " ")
+        ),
+        None,
+    )
+    if start is None:
+        stanza = [
+            command,
+            f"   file {default_file}",
+            *(f"   enable {name}" for name in enables),
+            f"end_{command}",
+        ]
+        body = text.rstrip()
+        return (body + "\n\n" if body else "") + "\n".join(stanza) + "\n", True
+
+    end_token = f"end_{command}"
+    inline = re.search(rf"\b{end_token}\b", lines[start])
+    if inline:
+        end = start
+        # 单行块只保留 end_ 之前的内容，后面会重建为多行
+        block = [lines[start][: inline.start()].rstrip(), end_token]
+    else:
+        end = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if lines[index].strip() == end_token
+            ),
+            None,
+        )
+        if end is None:
+            return text, False
+        block = lines[start : end + 1]
+
+    changed = False
+    existing: set[str] = set()
+    has_file = False
+    for index, line in enumerate(block):
+        enable_match = re.match(r"\s*enable\s+(\w+)", line, re.I)
+        if enable_match:
+            existing.add(enable_match.group(1).upper())
+            continue
+        file_match = re.search(r"\bfile\s+(\S+)", line, re.I)
+        if file_match:
+            has_file = True
+            # NULL 等于关闭输出，这里改成真实文件，保证留痕和验收有东西可读
+            if file_match.group(1).upper() == "NULL":
+                block[index] = line[: file_match.start(1)] + default_file
+                changed = True
+
+    insert: list[str] = []
+    if not has_file:
+        insert.append(f"   file {default_file}")
+    insert.extend(
+        f"   enable {name}" for name in enables if name.upper() not in existing
+    )
+    if not insert and not changed:
+        return text, False
+
+    new_block = block[:-1] + insert + [block[-1]]
+    new_lines = lines[:start] + new_block + lines[end + 1 :]
+    result = "\n".join(new_lines)
+    if text.endswith("\n"):
+        result += "\n"
+    return result, True
+
+
+def _ensure_outputs(files: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """确保 event_pipe 与 event_output 存在且 enable 完整。
+
+    模型可能整块漏写、只写一部分，或写到没被 main.txt include 的文件里；
+    这里优先落到 main.txt，只有被 include 的文件才能承载输出块，保证配置
+    真的被 AFSIM 加载。
 
     Args:
         files: 生成文件映射。
-        contract: 当前需求契约。
 
     Returns:
-        处理后的文件映射与是否发生注入。
+        处理后的文件映射与被修改的输出块名。
     """
-    if not contract.needs_event_evidence:
-        return files, False
-    if any("event_output" in content for content in files.values()):
-        return files, False
-    if "main.txt" not in files:
-        return files, False
     updated = dict(files)
-    updated["main.txt"] = updated["main.txt"].rstrip() + "\n\n" + EVENT_OUTPUT_STANZA
-    return updated, True
+    changed: list[str] = []
+    main_text = updated.get("main.txt", "")
+    included = set(
+        re.findall(r"(?mi)^\s*include(?:_once)?\s+(\S+)", main_text)
+    )
+
+    for command, (default_file, enables) in OUTPUT_SPECS.items():
+        pattern = rf"(?mi)^\s*{command}\b"
+        if re.search(pattern, main_text):
+            target = "main.txt"
+        else:
+            # 只有 main 明确 include 的文件里的块才会生效
+            target = next(
+                (
+                    name
+                    for name, content in updated.items()
+                    if name in included and re.search(pattern, content)
+                ),
+                "main.txt",
+            )
+        if target not in updated:
+            continue
+        text, modified = _complete_output_block(
+            updated[target], command, default_file, enables
+        )
+        if modified:
+            updated[target] = text
+            changed.append(command)
+    return updated, changed
 
 
 def parse_requirement(state: MainState) -> dict:
@@ -336,10 +460,9 @@ def write_files(state: MainState) -> dict:
     """把生成文件写入运行目录，并复制一份到本轮的留痕目录。"""
     run_dir = _run_dir(state)
     run_dir.mkdir(parents=True, exist_ok=True)
-    # event_output 默认写 output/，目录不存在时 AFSIM 会直接报错
+    # output/ 目录不存在时，AFSIM 写 evt/aer 会直接报错
     (run_dir / "output").mkdir(exist_ok=True)
-    contract = ScenarioContract.model_validate(state["contract"]) if state.get("contract") else ScenarioContract()
-    files, _ = _ensure_event_output(state.get("files", {}), contract)
+    files, _ = _ensure_outputs(state.get("files", {}))
 
     written = 0
     # 超出上限的文件静默跳过，避免模型吐出大量杂项文件占满工作区

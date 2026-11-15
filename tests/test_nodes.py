@@ -1,43 +1,97 @@
-"""event_output 注入、定向修复与静态检查短路的单元测试。"""
+"""输出块补全、定向修复与静态检查短路的单元测试。"""
 
 from types import SimpleNamespace
 
-from afsim_lg.contract import ScenarioContract
 from afsim_lg.graph import nodes
-from afsim_lg.graph.nodes import _ensure_event_output
 
 
-def contract_with_events():
-    """构造要求探测事件的契约。"""
-    return ScenarioContract.model_validate(
-        {"expectations": [{"kind": "detect", "actor_side": "red", "target_side": "blue"}]}
+def test_injects_both_output_blocks_by_default():
+    """没有交战要求时也默认补齐 event_pipe 与 event_output。"""
+    files = {"main.txt": "end_time 60 sec\n"}
+    result, changed = nodes._ensure_outputs(files)
+    text = result["main.txt"]
+    assert changed == ["event_pipe", "event_output"]
+    assert "file output/events.aer" in text
+    assert "file output/events.evt" in text
+    for enable in (
+        "AIRCOMBAT",
+        "TRACK_UPDATE",
+        "BEHAVIOR_TOOL",
+        "PLATFORM_ADDED",
+        "SENSOR_TRACK_INITIATED",
+    ):
+        assert f"enable {enable}" in text
+    assert "end_time 60 sec" in text
+
+
+def test_completes_missing_enables_without_duplicates():
+    """已有块只补缺失 enable，保留自定义 file，不重复 enable。"""
+    files = {
+        "main.txt": (
+            "event_output\n"
+            "   file output/custom.evt\n"
+            "   enable WEAPON_HIT\n"
+            "end_event_output\n"
+        )
+    }
+    result, changed = nodes._ensure_outputs(files)
+    text = result["main.txt"]
+    assert "event_output" in changed
+    assert text.count("enable WEAPON_HIT") == 1
+    assert "enable PLATFORM_ADDED" in text
+    assert "file output/custom.evt" in text
+
+
+def test_expands_single_line_block_and_replaces_null():
+    """单行块展开为多行，file NULL 改成真实输出文件。"""
+    files = {"main.txt": "event_output file NULL end_event_output\n"}
+    result, _ = nodes._ensure_outputs(files)
+    text = result["main.txt"]
+    assert "file NULL" not in text
+    assert "file output/events.evt" in text
+    assert "enable PLATFORM_ADDED" in text
+    assert text.count("end_event_output") == 1
+
+
+def test_keeps_complete_blocks_untouched():
+    """两个块都完整时不改写文本。"""
+    text = (
+        "event_pipe\n   file output/events.aer\n"
+        "   enable AIRCOMBAT\n   enable TRACK_UPDATE\n   enable BEHAVIOR_TOOL\n"
+        "end_event_pipe\n\n"
+        "event_output\n   file output/events.evt\n"
+        "   enable PLATFORM_ADDED\n   enable SENSOR_TRACK_INITIATED\n"
+        "   enable WEAPON_FIRED\n   enable WEAPON_HIT\n   enable PLATFORM_BROKEN\n"
+        "end_event_output\n"
     )
+    result, changed = nodes._ensure_outputs({"main.txt": text})
+    assert changed == []
+    assert result["main.txt"] == text
 
 
-def test_injects_event_output_when_missing():
-    """缺少事件输出时应追加标准块。"""
-    files = {"main.txt": "end_time 60 sec\n"}
-    result, injected = _ensure_event_output(files, contract_with_events())
-    assert injected is True
+def test_completes_block_in_included_file():
+    """块写在被 include 的 setup.txt 时就地补全，不在 main.txt 重复添加。"""
+    files = {
+        "main.txt": "include setup.txt\nend_time 10 sec\n",
+        "setup.txt": "event_output file NULL end_event_output\n",
+    }
+    result, changed = nodes._ensure_outputs(files)
+    assert "event_output" in changed
+    assert "event_output" in result["setup.txt"]
+    assert "event_output" not in result["main.txt"]
+    assert "event_pipe" in result["main.txt"]
+
+
+def test_moves_outputs_to_main_when_setup_not_included():
+    """输出块在不被 include 的文件里时不生效，应补到 main.txt。"""
+    files = {
+        "main.txt": "end_time 10 sec\n",
+        "setup.txt": "event_output file NULL end_event_output\n",
+    }
+    result, changed = nodes._ensure_outputs(files)
+    assert set(changed) == {"event_pipe", "event_output"}
     assert "event_output" in result["main.txt"]
-    assert "enable PLATFORM_ADDED" in result["main.txt"]
-    assert "end_time 60 sec" in result["main.txt"]
-
-
-def test_keeps_existing_event_output():
-    """已有事件输出时不应覆盖模型的选择。"""
-    files = {"main.txt": "event_output file output/x.evt end_event_output\nend_time 60 sec\n"}
-    result, injected = _ensure_event_output(files, contract_with_events())
-    assert injected is False
-    assert result == files
-
-
-def test_skips_injection_without_expectations():
-    """无交战要求时不需要注入事件输出。"""
-    files = {"main.txt": "end_time 60 sec\n"}
-    result, injected = _ensure_event_output(files, ScenarioContract())
-    assert injected is False
-    assert result == files
+    assert "file output/events.evt" in result["main.txt"]
 
 
 def test_generate_repairs_only_returned_files(monkeypatch):
