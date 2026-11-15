@@ -11,6 +11,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# 行首时间戳（秒或 h:m:s）+ 全大写事件名 + 其余消息
 RECORD_RE = re.compile(r"^(\d+(?::\d+){0,2}(?:\.\d+)?)\s+([A-Z][A-Z0-9_]*)\b\s*(.*)$")
 SIDE_RE = re.compile(r"Side:\s*([A-Za-z_]+)")
 RESULT_RE = re.compile(r"Result:\s*([A-Za-z_]+)")
@@ -56,6 +57,7 @@ def time_to_seconds(value: str) -> float:
     """
     if ":" in value:
         parts = [float(p) for p in value.split(":")]
+        # 从高位向低位折叠：h:m:s → h*3600 + m*60 + s，纯秒数直接返回
         seconds = 0.0
         for part in parts:
             seconds = seconds * 60 + part
@@ -76,6 +78,7 @@ def read_records(text: str) -> tuple[list[str], int]:
     """
     records: list[str] = []
     buffer = ""
+    # 这里只负责合并续行；无法解析的记录由 parse_evt 按正则失败计数
     parse_errors = 0
     for raw in text.splitlines():
         line = raw.rstrip()
@@ -110,6 +113,7 @@ def parse_evt(path: Path) -> EvtSummary:
     text = path.read_text(encoding="utf-8", errors="replace")
     records, errors = read_records(text)
     summary.parse_errors = errors
+    # 去重键：探测按 (平台, 目标)，毁伤按被毁平台；同一交战会被反复上报
     seen_detections: set[tuple[str, str]] = set()
     killed: set[str] = set()
 
@@ -127,10 +131,12 @@ def parse_evt(path: Path) -> EvtSummary:
             continue
 
         if event == "PLATFORM_ADDED":
+            # 消息形如 "<平台名> ... Side: blue"，阵营只在这里出现
             side = SIDE_RE.search(rest)
             if side:
                 summary.platform_sides[tokens[0]] = side.group(1).lower()
         elif event == "SENSOR_TRACK_INITIATED" and len(tokens) >= 2:
+            # 前两个 token 依次是传感器平台与目标平台
             pair = (tokens[0], tokens[1])
             if pair not in seen_detections:
                 seen_detections.add(pair)
@@ -143,6 +149,7 @@ def parse_evt(path: Path) -> EvtSummary:
                     "time": timestamp,
                     "actor": tokens[0],
                     "target": tokens[1],
+                    # 第三个 token 才是武器名，部分记录可能没有
                     "weapon": tokens[2] if len(tokens) > 2 else "",
                 }
             )
@@ -155,6 +162,7 @@ def parse_evt(path: Path) -> EvtSummary:
                 "result": result.group(1) if result else "",
             }
             summary.hits.append(hit)
+            # 命中不等于毁伤：只有 Result 为 KILLED/DESTROYED 才计入 kills
             if hit["result"].upper() in {"KILLED", "DESTROYED"} and tokens[1] not in killed:
                 killed.add(tokens[1])
                 summary.kills.append(
@@ -162,6 +170,7 @@ def parse_evt(path: Path) -> EvtSummary:
                 )
         elif event == "PLATFORM_BROKEN" and tokens[0] not in killed:
             killed.add(tokens[0])
+            # 平台损坏事件不带攻击者，killer 留空，检查时只按受害者阵营匹配
             summary.kills.append({"time": timestamp, "victim": tokens[0], "killer": ""})
     return summary
 
@@ -175,6 +184,7 @@ def find_evt(run_dir: Path) -> Path | None:
     Returns:
         evt 路径；没有可用文件时返回 None。
     """
+    # 同一 run 目录跨轮次复用，旧 evt 可能残留，按 mtime 取最新
     candidates = sorted(
         (p for p in (run_dir / "output").glob("*.evt") if p.stat().st_size > 0),
         key=lambda p: p.stat().st_mtime,

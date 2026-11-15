@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from afsim_lg.llm import chat
 
+# 模型输出中文、英文、大小写混用都有可能，统一在契约入口归一化，后续检查只认英文值
 SIDE_MAP = {
     "蓝": "blue",
     "蓝方": "blue",
@@ -26,6 +27,7 @@ SIDE_MAP = {
     "white": "white",
 }
 
+# 事件类型同样做中文/英文归一化，后续只按 detect/fire/hit/kill 统计
 KIND_MAP = {
     "探测": "detect",
     "发现": "detect",
@@ -135,6 +137,7 @@ class ScenarioContract(BaseModel):
         return bool(self.expectations)
 
 
+# 单位后禁止再跟字母，避免从 "minimum" 里截出 min、从 "hours" 里截出 h
 DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(秒|sec|secs|s|分钟|min|mins|分钟|小时|hour|hours|hr|h)(?![a-z])", re.I)
 DURATION_FACTOR = {
     "秒": 1, "s": 1, "sec": 1, "secs": 1,
@@ -155,6 +158,7 @@ def guess_duration(requirement: str) -> float | None:
     match = DURATION_RE.search(requirement)
     if not match:
         return None
+    # 只取第一处时长：想定通常只写一个总时长，多处时以先出现的为准
     return float(match.group(1)) * DURATION_FACTOR[match.group(2).lower()]
 
 
@@ -171,6 +175,7 @@ def fallback_contract(requirement: str, error: str) -> ScenarioContract:
     return ScenarioContract(
         summary=requirement.strip()[:200],
         duration_sec=guess_duration(requirement),
+        # 平台与事件留空：降级契约只保证时长，不能把猜出来的需求当成必须满足
         notes=f"契约解析失败，使用降级契约：{error}",
     )
 
@@ -188,8 +193,10 @@ def parse_contract(requirement: str) -> tuple[ScenarioContract, str]:
     error = ""
     for _ in range(2):
         try:
+            # 第二次把校验错误回传给模型，比原样重问更容易一次改对
             raw = chat(CONTRACT_SYSTEM + (f"\n上一次校验失败：{error}" if error else ""), prompt, json_mode=True)
             return ScenarioContract.model_validate(json.loads(raw)), ""
         except (json.JSONDecodeError, ValueError) as exc:
+            # pydantic 的 ValidationError 是 ValueError 子类，一并按解析失败处理
             error = str(exc)[:500]
     return fallback_contract(requirement, error), error

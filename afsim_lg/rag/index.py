@@ -11,6 +11,7 @@ from afsim_lg.config import get_settings
 from afsim_lg.rag.chunker import Chunk, chunk_skills
 from afsim_lg.rag.embed import embed_query, embed_texts
 
+# 分批写入：一次性提交全部向量与正文会让内存峰值和请求耗时都不可控
 WRITE_BATCH = 64
 
 
@@ -32,6 +33,7 @@ def _chunk_id(chunk: Chunk) -> str:
 
 
 def _metadata(chunk: Chunk) -> dict:
+    # 元数据保持扁平：Chroma 只接受标量值，检索结果展示与 where 过滤都靠它
     return {
         "skill": chunk.skill,
         "path": chunk.path,
@@ -81,6 +83,7 @@ def build_index(base: Path, rebuild: bool = False) -> IndexStats:
     if rebuild and settings.corpus_collection in [
         c.name for c in client.list_collections()
     ]:
+        # 先删集合：切块策略变化后旧块会残留，不删会混进检索结果
         client.delete_collection(settings.corpus_collection)
     collection = client.get_or_create_collection(
         name=settings.corpus_collection,
@@ -100,6 +103,7 @@ def build_index(base: Path, rebuild: bool = False) -> IndexStats:
     elapsed = time.monotonic() - started
     return IndexStats(
         chunks=collection.count(),
+        # 按“技能/路径”去重统计源文件数，一个文件会切成多个块
         files=len({f"{c.skill}/{c.path}" for c in chunks}),
         seconds=elapsed,
         collection=settings.corpus_collection,
@@ -119,6 +123,7 @@ def search(query: str, k: int = 8, where: dict | None = None) -> list[dict]:
         命中列表，包含正文、元数据与 cosine 距离。
     """
     collection = get_collection(create=False)
+    # 集合按 cosine 距离建，distance 越小越相近；这里只透传，不在此处排序
     result = collection.query(
         query_embeddings=[embed_query(query)],
         n_results=k,

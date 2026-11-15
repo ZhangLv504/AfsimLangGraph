@@ -33,6 +33,7 @@ def build_graph(checkpointer=None):
     graph.add_edge(START, "parse_requirement")
     graph.add_edge("parse_requirement", "retrieve")
     graph.add_edge("retrieve", "generate")
+    # 生成阶段解析不出文件时无法落盘，直接进 fix 汇总错误信息
     graph.add_conditional_edges(
         "generate",
         nodes.route_after_generate,
@@ -40,11 +41,13 @@ def build_graph(checkpointer=None):
     )
     graph.add_edge("write", "validate")
     graph.add_edge("validate", "assess")
+    # 验收通过就收尾，否则带着本轮的检查与事件证据进入修复
     graph.add_conditional_edges(
         "assess",
         nodes.route_after_assess,
         {"fix": "fix", "finalize": "finalize"},
     )
+    # 还有修复轮次就重新生成，达到 max_attempts 直接收尾
     graph.add_conditional_edges(
         "fix",
         nodes.route_after_fix,
@@ -86,4 +89,5 @@ def run(requirement: str, max_attempts: int = 2, run_id: str | None = None) -> d
         result = graph.invoke(
             initial, config={"configurable": {"thread_id": run_id}}
         )
+    # 连接随 with 关闭，检查点已落盘，可按 thread_id 回放
     return result

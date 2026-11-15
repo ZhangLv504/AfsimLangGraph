@@ -44,6 +44,7 @@ def chat(
             {"role": "user", "content": user},
         ],
         "stream": False,
+        # 上限按本机 8 GB 显存设定；上下文越大，与 bge-m3 同时驻留的余量越薄
         "options": {
             "temperature": temperature,
             "num_ctx": num_ctx,
@@ -51,6 +52,7 @@ def chat(
         },
     }
     if json_mode:
+        # 让 Ollama 在采样阶段就约束为合法 JSON，减少解析失败
         payload["format"] = "json"
     # trust_env=False：本机环境注入的 NO_PROXY 含 [::1]，httpx 解析会直接抛错
     with httpx.Client(base_url=settings.ollama_host, timeout=timeout, trust_env=False) as client:
@@ -58,5 +60,6 @@ def chat(
         response.raise_for_status()
         content = response.json().get("message", {}).get("content", "")
     if not content.strip():
+        # 空回复按调用失败处理，让上层走重试或降级而不是把它当成有效输出
         raise LLMError("empty response from model")
     return content

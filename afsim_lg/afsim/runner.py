@@ -45,6 +45,7 @@ def extract_errors(output: str) -> list[str]:
         if not stripped.startswith(("***** ERROR", "***** FATAL")):
             continue
         message = stripped.lstrip("* ").strip()
+        # 位置信息单独打印在错误行的下一行，并入同一条便于模型定位
         location = lines[i + 1].strip() if i + 1 < len(lines) else ""
         if location.startswith("'"):
             message = f"{message} @ {location}"
@@ -95,6 +96,7 @@ def run_mission(
         elapsed = time.monotonic() - started
         output = proc.stdout + proc.stderr
         errors = extract_errors(output)
+        # 退出码之外再用 FATAL 兜底，避免日志已报致命错误却被判成功
         ok = proc.returncode == 0 and not any("FATAL" in e for e in errors)
         return MissionResult(
             ok=ok,
@@ -112,6 +114,7 @@ def run_mission(
             output = output.decode("utf-8", "replace")
         return MissionResult(
             ok=False,
+            # 超时没有真实退出码，用 -1 标记，调用方据此区分“跑挂”和“超时”
             exit_code=-1,
             workdir=workdir,
             input_file=input_file,

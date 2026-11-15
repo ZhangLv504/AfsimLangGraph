@@ -147,6 +147,7 @@ def parse_files(text: str) -> dict[str, str]:
         mark = FILE_MARK_RE.match(line)
         if mark:
             flush()
+            # 模型偶尔把文件名包在反引号里或写成 Windows 路径
             current = mark.group(1).strip().strip("`").replace("\\", "/")
             buffer = []
             continue
@@ -225,10 +226,12 @@ def generate(state: MainState) -> dict:
     user_parts = [f"【需求】\n{state['requirement']}"]
     contract = state.get("contract")
     if contract:
+        # 契约约束平台、时长与事件范围，减少模型按常识补装备
         user_parts.append(
             "【需求契约】\n" + json.dumps(contract, ensure_ascii=False, indent=1)
         )
     if state.get("feedback"):
+        # 反馈来自上一轮的 mission 报错与验收缺口，定向修比整份重写省上下文
         user_parts.append(f"【上一轮失败反馈】\n{state['feedback']}")
     user_parts.append(f"【技能检索片段】\n{_corpus_block(state.get('retrieved', []))}")
     user_parts.append("请输出完整工程文件。")
@@ -236,12 +239,14 @@ def generate(state: MainState) -> dict:
 
     files = parse_files(chat(GENERATOR_SYSTEM, prompt))
     if not files:
+        # 7B 模型偶尔漏掉文件标记；先补一次格式要求，不占用修复轮次
         retry_prompt = prompt + "\n\n注意：你的输出没有可解析的文件标记。只输出文件标记格式。"
         files = parse_files(chat(GENERATOR_SYSTEM, retry_prompt))
     error = "" if files else "模型输出中没有可解析的 ===FILE: ... === 文件块"
     return {
         "files": files,
         "generation_error": error,
+        # 生成次数单独计数；用 attempt + 1 推算会把修复轮次也算成一次生成
         "generation": state.get("generation", 0) + 1,
     }
 
@@ -250,11 +255,13 @@ def write_files(state: MainState) -> dict:
     """把生成文件写入运行目录，并复制一份到本轮的留痕目录。"""
     run_dir = _run_dir(state)
     run_dir.mkdir(parents=True, exist_ok=True)
+    # event_output 默认写 output/，目录不存在时 AFSIM 会直接报错
     (run_dir / "output").mkdir(exist_ok=True)
     contract = ScenarioContract.model_validate(state["contract"]) if state.get("contract") else ScenarioContract()
     files, _ = _ensure_event_output(state.get("files", {}), contract)
 
     written = 0
+    # 超出上限的文件静默跳过，避免模型吐出大量杂项文件占满工作区
     for name, content in list(files.items())[:MAX_FILES]:
         target = _safe_path(run_dir, name)
         if target is None:
@@ -296,6 +303,7 @@ def validate(state: MainState) -> dict:
     """
     run_dir = _run_dir(state)
     result = run_mission(run_dir)
+    # 运行目录只保留最新一轮输出，attempt 目录保留历史，内容相同
     (run_dir / "mission_stdout.log").write_text(result.output, encoding="utf-8")
     attempt_dir = Path(state["attempt_dir"]) if state.get("attempt_dir") else _attempt_dir(state)
     attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -317,6 +325,7 @@ def _judge(state: MainState, checks: list[dict], evidence: dict) -> dict:
     main_txt = ""
     main_path = run_dir / "main.txt"
     if main_path.is_file():
+        # 验收主要看契约、检查项与事件证据，main.txt 只取开头，避免上下文超限
         main_txt = main_path.read_text(encoding="utf-8")[:MAIN_CHARS]
     check_lines = "\n".join(
         f"- {'PASS' if c['ok'] else 'FAIL'} {c['name']}: {c['detail']}" for c in checks
@@ -339,6 +348,7 @@ def assess(state: MainState) -> dict:
     attempt_dir = Path(state["attempt_dir"]) if state.get("attempt_dir") else _attempt_dir(state)
 
     if not mission.get("ok"):
+        # 编译/运行失败时 evt 不可信，不跑确定性检查，直接把报错交给修复
         assessment = {
             "passed": False,
             "missing": mission.get("errors", []),
@@ -369,6 +379,7 @@ def assess(state: MainState) -> dict:
         missing = list(verdict.get("missing", []))
         fix_hint = verdict.get("fix_hint", "")
     except (json.JSONDecodeError, RuntimeError):
+        # 验收模型不可用按“未通过”处理，让流程走修复而不是抛异常中断
         judge_passed = False
         missing = ["验收模型输出无法解析"]
         fix_hint = "重新生成并确保满足需求。"
@@ -438,6 +449,7 @@ def finalize(state: MainState) -> dict:
     attempts = []
     attempts_dir = run_dir / "attempts"
     if attempts_dir.is_dir():
+        # attempt-NN 的字典序就是轮次顺序；损坏的 summary 跳过，不阻断收尾
         for summary in sorted(attempts_dir.glob("attempt-*/summary.json")):
             try:
                 attempts.append(json.loads(summary.read_text(encoding="utf-8")))
@@ -463,6 +475,7 @@ def finalize(state: MainState) -> dict:
 
 def route_after_generate(state: MainState) -> str:
     """有可写入文件则继续落盘，否则进入修复分支。"""
+    # 解析失败时 files 为空且 generation_error 非空，走 fix 汇总错误
     return "write" if state.get("files") and not state.get("generation_error") else "fix"
 
 

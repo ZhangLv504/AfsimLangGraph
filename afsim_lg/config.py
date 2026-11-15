@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+# 项目根 = afsim_lg 的上一级，所有默认路径都相对它解析，避免依赖启动目录
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -16,15 +17,19 @@ class Settings:
     """一次进程生命周期内使用的配置快照。"""
 
     project_root: Path
+    # 默认使用项目内的 AFSIM 副本，不要求机器上已设置 AFSIM_HOME
     afsim_home: Path
+    # bin 与 mission.exe 由 afsim_home 派生，单独开放覆盖是为了兼容自定义安装布局
     afsim_bin: Path
     mission_exe: Path
     ollama_host: str
     llm_model: str
     embed_model: str
+    # 集合名固定：建库端与检索端必须同名，换集合名等于换库
     chroma_dir: Path
     corpus_collection: str
     runs_dir: Path
+    # 检查点库与 run_id 一一对应，便于回放单次运行
     checkpoints_db: Path
 
 

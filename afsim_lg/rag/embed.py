@@ -4,6 +4,7 @@ import httpx
 
 from afsim_lg.config import get_settings
 
+# 分批请求 Ollama：一次提交过多文本会拉长单次响应，也更容易触发超时
 BATCH_SIZE = 16
 
 

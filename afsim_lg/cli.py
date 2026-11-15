@@ -1,4 +1,4 @@
-"""命令行入口：环境检查、建库、检索、单次校验与完整生成流程。"""
+"""命令行入口：环境检查、建库、检索、单次校验、完整生成流程与流程图导出。"""
 
 import argparse
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 
 from afsim_lg.afsim.runner import check_env, run_mission
 from afsim_lg.config import get_settings
-from afsim_lg.graph.build import run as run_graph
+from afsim_lg.graph.build import build_graph, run as run_graph
 from afsim_lg.rag.index import build_index, search
 
 
@@ -57,6 +57,9 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--max-attempts", type=int, default=2)
     run_parser.add_argument("--run-id")
 
+    graph_parser = sub.add_parser("export-graph", help="导出 Mermaid 流程图到 Markdown")
+    graph_parser.add_argument("output", nargs="?", default="graph.md", help="输出路径，相对路径按项目根解析")
+
     args = parser.parse_args(argv)
     if args.command == "check-afsim":
         print(json.dumps(check_env(), indent=2, ensure_ascii=False))
@@ -99,6 +102,23 @@ def main(argv: list[str] | None = None) -> int:
         }
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0 if summary["status"] == "passed" else 1
+    if args.command == "export-graph":
+        source = build_graph().get_graph().draw_mermaid()
+        if source.startswith("---"):
+            # 去掉 Mermaid 的 YAML 前端配置，部分 Markdown 预览器不识别。
+            source = source.split("---", 2)[2].lstrip()
+        out = Path(args.output)
+        if not out.is_absolute():
+            out = get_settings().project_root / out
+        out.write_text(
+            "# 当前 LangGraph 流程图\n\n"
+            "由 `build_graph().get_graph().draw_mermaid()` 生成，"
+            "实线为固定边，虚线为条件边。\n\n"
+            f"```mermaid\n{source.rstrip()}\n```\n",
+            encoding="utf-8",
+        )
+        print(out)
+        return 0
     return 2
 
 

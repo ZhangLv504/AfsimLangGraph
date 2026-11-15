@@ -5,8 +5,11 @@ import re
 from afsim_lg.afsim.evt import EvtSummary
 from afsim_lg.contract import Expectation, ScenarioContract
 
+# 数值和单位分开捕获，单位换算在 parse_end_time 里按表处理
 END_TIME_RE = re.compile(r"(?mi)^\s*end_time\s+([\d.]+)\s*([A-Za-z]+)")
+# 只匹配 platform 实例行（platform <名称> <类型>），不匹配 platform_type 定义
 PLATFORM_INSTANCE_RE = re.compile(r"(?mi)^\s*platform\s+[A-Za-z_][A-Za-z0-9_]*")
+# 只匹配行首 side 声明，不解析类型定义内部的选择器
 SIDE_RE = re.compile(r"(?mi)^\s*side\s+([A-Za-z_]+)")
 
 TIME_FACTORS = {
@@ -24,6 +27,7 @@ EVENT_KEYS = [
 
 
 def _check(name: str, ok: bool, detail: str) -> dict:
+    """构造统一结构的检查项，便于汇总和留痕。"""
     return {"name": name, "ok": ok, "detail": detail}
 
 
@@ -39,6 +43,7 @@ def parse_end_time(files_text: str) -> tuple[float, str] | None:
     for match in END_TIME_RE.finditer(files_text):
         factor = TIME_FACTORS.get(match.group(2).lower())
         if factor:
+            # 取第一处可识别单位的 end_time；多个文件里出现多次时以先出现的为准
             return float(match.group(1)) * factor, match.group(0).strip()
     return None
 
@@ -71,6 +76,7 @@ def _expectation_count(expectation: Expectation, evt: EvtSummary) -> int:
             and _match_side(evt, r["target"], expectation.target_side)
         )
     if kind == "kill":
+        # PLATFORM_BROKEN 没有攻击者；killer 为空时只按受害者阵营匹配
         return sum(
             1
             for r in evt.kills
@@ -114,6 +120,7 @@ def evaluate(
 
     expected_sides = contract.expected_sides
     if expected_sides:
+        # 阵营从工程文本检查而不是 evt：没有交战事件时 evt 里也可能没有平台记录
         declared = {m.group(1).lower() for m in SIDE_RE.finditer(files_text)}
         missing = sorted(expected_sides - declared)
         checks.append(
@@ -121,6 +128,7 @@ def evaluate(
         )
 
     if contract.expected_platform_count:
+        # platform_type 定义不算实例，这里只数 platform <名称> <类型> 行
         actual = len(PLATFORM_INSTANCE_RE.findall(files_text))
         checks.append(
             _check(
@@ -132,6 +140,7 @@ def evaluate(
 
     if contract.expectations:
         if evt is None:
+            # 契约有事件要求却没有任何 evt，先记一条总失败，再逐项记缺失
             checks.append(_check("事件证据", False, "契约要求交战事件，但没有生成 output/*.evt 或文件为空"))
         for expectation in contract.expectations:
             if evt is None:
@@ -154,6 +163,7 @@ def evaluate(
                 )
             )
 
+    # 只保留验收需要的字段与五类关键事件计数，避免把整份 evt 明细写进留痕
     evidence = {
         "evt_present": evt is not None,
         "evt_path": evt.path if evt else "",

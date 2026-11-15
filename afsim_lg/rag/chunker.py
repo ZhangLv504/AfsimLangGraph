@@ -4,9 +4,11 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# 块太小检索噪声大，块太大挤占生成上下文；AFSIM 块允许放宽到两倍
 MIN_CHARS = 400
 MAX_CHARS = 1800
 
+# 目录名 → kind，用于检索结果展示和按类别过滤
 ROOT_KINDS = {
     "refs": "ref",
     "memory": "lesson",
@@ -97,6 +99,7 @@ def _split_long(text: str, limit: int) -> list[str]:
     """按行把超长文本切到 limit 以内，尽量不破坏语句。"""
     if len(text) <= limit:
         return [text]
+    # 按行切而不是按字符切：尽量不把一条命令或一句说明劈成两半
     lines = text.splitlines()
     parts, current, size = [], [], 0
     for line in lines:
@@ -147,6 +150,7 @@ def chunk_markdown(text: str, path: str, skill: str, kind: str) -> list[Chunk]:
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("```") or stripped.startswith("~~~"):
+            # 围栏内原样保留：示例代码不参与标题识别和长度切分
             marker = stripped[:3]
             if not in_fence:
                 in_fence, fence_marker = True, marker
@@ -157,6 +161,7 @@ def chunk_markdown(text: str, path: str, skill: str, kind: str) -> list[Chunk]:
         heading_match = None if in_fence else HEADING_RE.match(stripped)
         if heading_match:
             level = len(heading_match.group(1))
+            # 只有攒够最小长度才切，避免每个标题都产生一个碎块
             if buffer and sum(len(x) + 1 for x in buffer) >= MIN_CHARS:
                 flush()
             headings = headings[: level - 1]
@@ -187,6 +192,7 @@ def chunk_afsim_text(text: str, path: str, skill: str, kind: str) -> list[Chunk]
     """
     lines = text.splitlines()
     segments: list[tuple[str, str]] = []
+    # 块前的注释行随块保留，块名和用途通常写在注释里
     pending_comments: list[str] = []
     prose: list[str] = []
 
@@ -205,6 +211,7 @@ def chunk_afsim_text(text: str, path: str, skill: str, kind: str) -> list[Chunk]
         if not token_match or lines[index].lstrip().startswith("#"):
             return None
         token = token_match.group(1)
+        # 必须能找到同名 end_：没有闭合的命令（如 simulation）不当作独立块
         for later in lines[index + 1 :]:
             end_match = BLOCK_END_RE.match(later.strip())
             if end_match and end_match.group(1).lower() == token.lower():
@@ -236,6 +243,7 @@ def chunk_afsim_text(text: str, path: str, skill: str, kind: str) -> list[Chunk]
                     break
                 index += 1
             body = "\n".join(block_lines).strip()
+            # 块上限放宽一倍：宁可整块略大，也不要拆开定义
             for part in _split_long(body, MAX_CHARS * 2):
                 segments.append((part, token))
             continue
@@ -249,6 +257,7 @@ def chunk_afsim_text(text: str, path: str, skill: str, kind: str) -> list[Chunk]
 
     merged: list[tuple[str, str]] = []
     for body, block in segments:
+        # 相邻短散文合并，避免碎块；块片段保持独立，不与散文混合
         if merged and len(merged[-1][0]) < MIN_CHARS and merged[-1][1] == block == "":
             merged[-1] = (merged[-1][0] + "\n\n" + body, "")
         else:
@@ -265,6 +274,7 @@ def chunk_file(skill_root: Path, path: Path) -> list[Chunk]:
     skill = skill_root.name
     kind = classify_kind(skill_root, path)
     rel = path.relative_to(skill_root).as_posix()
+    # utf-8-sig：语料里有带 BOM 的文件，不去掉会在首块开头留下不可见字符
     text = path.read_text(encoding="utf-8-sig", errors="replace")
     chunks = (
         chunk_markdown(text, rel, skill, kind)
