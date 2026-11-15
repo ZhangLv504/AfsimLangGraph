@@ -10,7 +10,7 @@ from afsim_lg.afsim.runner import run_mission
 from afsim_lg.afsim.statics import check_platform_types
 from afsim_lg.config import get_settings
 from afsim_lg.contract import ScenarioContract, parse_contract
-from afsim_lg.graph.checks import evaluate
+from afsim_lg.graph.checks import evaluate, filter_judge_missing
 from afsim_lg.graph.state import MainState
 from afsim_lg.llm import chat
 from afsim_lg.rag.errors import (
@@ -29,6 +29,8 @@ CORPUS_CHARS = 1400
 MAIN_CHARS = 4000
 # Undefined X 只报名字，不报位置；单独转成“补定义块”的指令，7B 才会照做
 UNDEFINED_ERROR_RE = re.compile(r"Undefined\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
+# antenna_pattern 等命令的 Bad value 通常是引用了不存在的定义
+BAD_VALUE_ERROR_RE = re.compile(r"Bad value for:\s*([A-Za-z_][A-Za-z0-9_]*)", re.I)
 # 定向修复时每个文件的展示上限：只看错误附近，避免整份工程撑爆上下文
 REPAIR_FILE_CHARS = 3000
 # 修复轮还要塞工程正文，重检索片段只取前几条、每条截得更短
@@ -98,7 +100,8 @@ JUDGE_SYSTEM = """你是 AFSIM 场景验收员。对照用户需求与需求契�
 2. 只检查需求原文中明确写出的内容；需求没写的平台、装备、交战一律不算缺失，不要按常识补默认要求。
 3. 契约 expectations 为空时，不得因为“没有探测/发射/命中”判失败。
 4. missing 必须是需求原文能对应的具体缺失（平台、阵营、装备、时长、明确要求的事件），不能是推测。
-5. 确定性检查全部通过且找不到具体缺失时，passed 应为 true。"""
+5. missing 中提到的平台/装备必须是需求原文出现过的名称；需求只写“飞机”时，不要要求具体机型。
+6. 确定性检查全部通过且找不到具体缺失时，passed 应为 true。"""
 
 
 REPAIR_SYSTEM = """你是 AFSIM 2.9.0 场景修复器。根据错误反馈与当前工程，只输出需要修改的文件。
@@ -115,7 +118,8 @@ REPAIR_SYSTEM = """你是 AFSIM 2.9.0 场景修复器。根据错误反馈与当
 4. platform 引用的 platform_type，以及 platform_type 里的 sensor/weapon/mover/radar_signature 等引用，必须在文件集中有定义；报 Undefined X 时补 X 的定义块，不要只改无关参数。
 5. 注释必须独立成行；不要使用 thread_count。
 6. 错误信息不足以判断时，宁可原样输出当前文件，也不要新增未定义的类型或命令。
-7. 保留当前工程里的 event_pipe / event_output 块及其 enable，不要删除。"""
+7. 保留当前工程里的 event_pipe / event_output 块及其 enable，不要删除。
+8. 报 Bad value for: antenna_pattern 时，所有 antenna_pattern 引用都必须有同名定义块，不要只改其中一处。"""
 
 
 def _run_dir(state: MainState) -> Path:
@@ -600,11 +604,17 @@ def assess(state: MainState) -> dict:
     evt = parse_evt(evt_path) if evt_path else None
     checks, evidence = evaluate(contract, files_text, evt)
 
+    judge_filtered: list[str] = []
     try:
         verdict = _judge(state, checks, evidence)
         judge_passed = bool(verdict.get("passed"))
-        missing = list(verdict.get("missing", []))
+        missing, judge_filtered = filter_judge_missing(
+            list(verdict.get("missing", [])), state["requirement"], contract
+        )
         fix_hint = verdict.get("fix_hint", "")
+        # 判失败的理由若全是需求/契约里没有的对象，且没有其他缺失，按通过处理
+        if not judge_passed and judge_filtered and not missing:
+            judge_passed = True
     except (json.JSONDecodeError, RuntimeError):
         # 验收模型不可用按“未通过”处理，让流程走修复而不是抛异常中断
         judge_passed = False
@@ -619,6 +629,7 @@ def assess(state: MainState) -> dict:
         "missing": failed + missing,
         "fix_hint": fix_hint,
         "deterministic_passed": all(c["ok"] for c in checks),
+        "judge_filtered": judge_filtered,
     }
     _write_json(attempt_dir / "assessment.json", assessment)
     _write_json(attempt_dir / "checks.json", checks)
@@ -659,6 +670,29 @@ def _undefined_hint(errors: list[str]) -> str:
         "radar_signature <名字> WSF_RADAR_SIGNATURE\n"
         "   constant 10 m^2\n"
         "end_radar_signature"
+    )
+
+
+def _bad_value_hint(errors: list[str]) -> str:
+    """把 Bad value 报错转成“检查所有引用是否有同名定义”的指令。"""
+    names = sorted(
+        {
+            match.group(1)
+            for error in errors
+            if (match := BAD_VALUE_ERROR_RE.search(error))
+        }
+    )
+    if not names:
+        return ""
+    return (
+        "参数取值错误：" + "、".join(names) + "。检查该命令的每一处引用是否都有同名定义块；"
+        "以 antenna_pattern 为例，引用处需要工程里存在：\n"
+        "antenna_pattern <名字>\n"
+        "   rectangular_pattern\n"
+        "      azimuth_beamwidth 2 deg\n"
+        "      elevation_beamwidth 2 deg\n"
+        "   end_rectangular_pattern\n"
+        "end_antenna_pattern"
     )
 
 
@@ -705,6 +739,9 @@ def fix(state: MainState) -> dict:
     undefined_hint = _undefined_hint(mission.get("errors", []))
     if undefined_hint:
         parts.append(undefined_hint)
+    bad_value_hint = _bad_value_hint(mission.get("errors", []))
+    if bad_value_hint:
+        parts.append(bad_value_hint)
     if assessment.get("missing"):
         parts.append("需求缺失：\n" + "\n".join(assessment["missing"]))
     if assessment.get("fix_hint"):

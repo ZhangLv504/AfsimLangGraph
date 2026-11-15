@@ -163,6 +163,16 @@ def test_undefined_hint_names_missing_object():
     assert nodes._undefined_hint(["Unknown command: foo"]) == ""
 
 
+def test_bad_value_hint_mentions_all_references():
+    """Bad value 报错应提示检查所有同名引用。"""
+    hint = nodes._bad_value_hint(
+        ["ERROR: Bad value for: antenna_pattern @ 'main.txt', line 53"]
+    )
+    assert "antenna_pattern" in hint
+    assert "每一处引用" in hint
+    assert nodes._bad_value_hint(["Unknown command: foo"]) == ""
+
+
 def test_merge_retrieved_prefers_error_hits():
     """合并时错误检索在前，重复块只保留一份。"""
     def hit(path, index, origin):
@@ -186,6 +196,34 @@ def test_merge_retrieved_prefers_error_hits():
     assert [h["metadata"]["path"] for h in merged] == ["same.txt", "other.txt"]
     assert merged[0]["origin"] == "error"
     assert merged[1]["origin"] == "requirement"
+
+
+def test_assess_overrides_fabricated_judge_failure(tmp_path, monkeypatch):
+    """验收模型以虚构缺失判失败时，过滤后应按通过处理。"""
+    monkeypatch.setattr(nodes, "get_settings", lambda: SimpleNamespace(runs_dir=tmp_path))
+    monkeypatch.setattr(nodes, "find_evt", lambda run_dir: None)
+    monkeypatch.setattr(
+        nodes,
+        "_judge",
+        lambda state, checks, evidence: {
+            "passed": False,
+            "missing": ["缺少交战事件"],
+            "fix_hint": "补充交战",
+        },
+    )
+    state = {
+        "run_id": "judge-filter",
+        "requirement": "蓝方一架飞机平飞 90 秒",
+        "contract": {"duration_sec": None},
+        "files": {"main.txt": "end_time 90 sec\n"},
+        "mission": {"ok": True, "errors": []},
+        "attempt": 0,
+        "generation_mode": "full",
+    }
+    result = nodes.assess(state)
+    assert result["status"] == "passed"
+    assert result["assessment"]["judge_filtered"] == ["缺少交战事件"]
+    assert result["assessment"]["missing"] == []
 
 
 def test_validate_skips_mission_on_static_error(tmp_path, monkeypatch):

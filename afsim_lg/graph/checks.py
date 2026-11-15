@@ -25,6 +25,54 @@ EVENT_KEYS = [
     "PLATFORM_BROKEN",
 ]
 
+# 只有非 land 域需要显式标记；land 是 AFSIM 默认值（文档：spatial_domain 缺省 land）
+DOMAIN_HINTS = {
+    "air": ("spatial_domain air", "wsf_air_mover", "wsf_p6dof_mover"),
+    "surface": ("spatial_domain surface", "wsf_surface_mover"),
+    "subsurface": ("spatial_domain subsurface", "wsf_subsurface_mover"),
+    "space": (
+        "spatial_domain space",
+        "wsf_space_mover",
+        "wsf_orbital_mover",
+        "wsf_norad_space_mover",
+    ),
+}
+# 中文装备描述 → 工程文本里应出现的关键字；词表外的描述不做判断
+SENSOR_HINTS = {
+    "雷达": ("radar",),
+    "红外": ("infrared", "ir_sensor"),
+    "光学": ("optical",),
+    "声学": ("acoustic",),
+    "传感器": ("sensor",),
+}
+WEAPON_HINTS = {
+    "导弹": ("missile", "aam", "agm", "sam", "ssm", "weapon"),
+    "火炮": ("gun", "cannon"),
+    "炸弹": ("bomb",),
+    "鱼雷": ("torpedo",),
+    "武器": ("weapon",),
+}
+# 只看定义行里的类型名，避免平台/实例名（如 RedRadar）冒充装备
+SENSOR_DEF_RE = re.compile(
+    r"(?mi)^\s*(?:add\s+|edit\s+)?sensor\s+\S+\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+WEAPON_DEF_RE = re.compile(
+    r"(?mi)^\s*(?:add\s+|edit\s+)?weapon\s+\S+\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+# 验收模型虚构缺失项时用来判断“需求/契约里根本没提”
+EVENT_TERMS = {
+    "detect": ("探测", "发现", "跟踪"),
+    "fire": ("发射", "开火"),
+    "hit": ("命中", "击中"),
+    "kill": ("摧毁", "击毁", "击杀"),
+}
+ENTITY_TERMS = (
+    "航母", "战斗机", "轰炸机", "运输机", "预警机", "直升机", "无人机",
+    "坦克", "装甲车", "军舰", "舰艇", "潜艇", "卫星", "雷达车",
+    "雷达", "传感器", "导弹", "火炮", "炸弹", "鱼雷",
+)
+
 
 def _check(name: str, ok: bool, detail: str) -> dict:
     """构造统一结构的检查项，便于汇总和留痕。"""
@@ -86,6 +134,59 @@ def _expectation_count(expectation: Expectation, evt: EvtSummary) -> int:
     return 0
 
 
+def _contains_marker(text: str, marker: str) -> bool:
+    """按标识符边界匹配关键字，避免 RedRadar 里的 radar 冒充雷达传感器。"""
+    pattern = rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])"
+    return re.search(pattern, text) is not None
+
+
+def _required_equipment(
+    descriptions: list[str], hints: dict[str, tuple]
+) -> dict[str, tuple]:
+    """从中文装备描述中找出需要检查的关键词组。"""
+    required: dict[str, tuple] = {}
+    for description in descriptions:
+        for term, markers in hints.items():
+            if term in description:
+                required[term] = markers
+    return required
+
+
+def filter_judge_missing(
+    missing: list[str], requirement: str, contract: ScenarioContract
+) -> tuple[list[str], list[str]]:
+    """丢弃验收模型虚构的平台/装备/事件缺失项。
+
+    只处理词表内能识别的对象；词表外或需求原文能对应的缺失项保留。
+    返回（保留项，被丢弃项），后者写入留痕便于回溯。
+    """
+    parts = [requirement, contract.summary, contract.notes]
+    for platform in contract.platforms:
+        parts.extend([platform.main_entity, *platform.sensors, *platform.weapons])
+    allowed_text = " ".join(parts)
+    allowed_events = {expectation.kind for expectation in contract.expectations}
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for item in missing:
+        fabricated = False
+        for kind, terms in EVENT_TERMS.items():
+            if kind in allowed_events:
+                continue
+            if any(term in item and term not in requirement for term in terms):
+                fabricated = True
+                break
+        # 契约没有事件要求时，“缺少交战”这类泛化结论也不应采纳
+        if not fabricated and not allowed_events and "交战" in item and "交战" not in requirement:
+            fabricated = True
+        if not fabricated:
+            fabricated = any(
+                term in item and term not in allowed_text for term in ENTITY_TERMS
+            )
+        (dropped if fabricated else kept).append(item)
+    return kept, dropped
+
+
 def evaluate(
     contract: ScenarioContract,
     files_text: str,
@@ -135,6 +236,64 @@ def evaluate(
                 "平台数量",
                 actual >= contract.expected_platform_count,
                 f"要求至少 {contract.expected_platform_count} 个 platform 实例，实际 {actual}",
+            )
+        )
+
+    normalized = re.sub(r"\s+", " ", files_text.lower())
+    required_domains = {
+        platform.domain for platform in contract.platforms if platform.domain in DOMAIN_HINTS
+    }
+    if required_domains:
+        missing_domains = sorted(
+            domain
+            for domain in required_domains
+            if not any(_contains_marker(normalized, hint) for hint in DOMAIN_HINTS[domain])
+        )
+        checks.append(
+            _check(
+                "平台域",
+                not missing_domains,
+                "缺少平台域标记：" + ", ".join(missing_domains)
+                if missing_domains
+                else "平台域标记齐全",
+            )
+        )
+
+    sensor_types = " ".join(SENSOR_DEF_RE.findall(files_text)).lower()
+    weapon_types = " ".join(WEAPON_DEF_RE.findall(files_text)).lower()
+    for label, hints, descriptions, types_text, any_type in (
+        (
+            "传感器",
+            SENSOR_HINTS,
+            [s for p in contract.platforms for s in p.sensors],
+            sensor_types,
+            sensor_types,
+        ),
+        (
+            "武器",
+            WEAPON_HINTS,
+            [w for p in contract.platforms for w in p.weapons],
+            weapon_types,
+            weapon_types,
+        ),
+    ):
+        required = _required_equipment(descriptions, hints)
+        if not required:
+            continue
+        missing_terms = []
+        for term, markers in required.items():
+            # “传感器/武器”这种泛化描述，只要存在同类定义就算满足
+            if term in {"传感器", "武器"} and any_type:
+                continue
+            if not any(_contains_marker(types_text, marker) for marker in markers):
+                missing_terms.append(term)
+        checks.append(
+            _check(
+                f"装备:{label}",
+                not missing_terms,
+                "缺少：" + "、".join(missing_terms)
+                if missing_terms
+                else "已包含 " + "、".join(required),
             )
         )
 

@@ -32,6 +32,15 @@ def test_extracts_undefined_object():
     assert "radar_signature" in keywords
 
 
+def test_extracts_bad_value_object():
+    """参数取值错误应能定位到具体命令名。"""
+    keywords = extract_error_keywords(
+        ["ERROR: Bad value for: antenna_pattern @ 'main.txt', line 53"]
+    )
+    assert "Bad value for: antenna_pattern" in keywords
+    assert "antenna_pattern" in keywords
+
+
 def test_empty_errors_return_empty():
     """没有报错时不应产生关键词。"""
     assert extract_error_keywords([]) == []

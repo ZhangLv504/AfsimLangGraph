@@ -38,6 +38,10 @@ _RULES: list[tuple[re.Pattern, Callable[[re.Match], list[str]]]] = [
         lambda m: [f"Undefined {m.group(1)}", m.group(1)],
     ),
     (
+        re.compile(r"Bad value for:\s*([A-Za-z_][A-Za-z0-9_]*)", re.I),
+        lambda m: [f"Bad value for: {m.group(1)}", m.group(1)],
+    ),
+    (
         re.compile(r"Unable to open[^'\n]*", re.I),
         lambda m: ["Unable to open"],
     ),
