@@ -1,4 +1,4 @@
-"""命令行入口：环境检查、建库、检索、单次校验、完整生成流程与流程图导出。"""
+"""命令行入口：环境检查、建库、检索、单次校验、完整生成流程、流程图导出与回归集。"""
 
 import argparse
 import json
@@ -10,6 +10,7 @@ from afsim_lg.afsim.runner import check_env, run_mission
 from afsim_lg.config import get_settings
 from afsim_lg.graph.build import build_graph, run as run_graph
 from afsim_lg.rag.index import build_index, search
+from afsim_lg.regression import CASES, run_all
 
 
 def _mission_dict(result) -> dict:
@@ -59,6 +60,11 @@ def main(argv: list[str] | None = None) -> int:
 
     graph_parser = sub.add_parser("export-graph", help="导出 Mermaid 流程图到 Markdown")
     graph_parser.add_argument("output", nargs="?", default="graph.md", help="输出路径，相对路径按项目根解析")
+
+    regress = sub.add_parser("regress", help="跑固定需求的端到端回归集")
+    regress.add_argument("--attempts", type=int, default=3, help="每个用例的最大生成轮数")
+    regress.add_argument("--case", action="append", dest="case_names", help="只跑指定用例，可重复")
+    regress.add_argument("--report-dir", help="报告目录，相对路径按项目根解析")
 
     args = parser.parse_args(argv)
     if args.command == "check-afsim":
@@ -120,6 +126,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(out)
         return 0
+    if args.command == "regress":
+        known = {case["name"] for case in CASES}
+        unknown = set(args.case_names or []) - known
+        if unknown:
+            print("unknown case: " + ", ".join(sorted(unknown)), file=sys.stderr)
+            return 2
+        cases = [
+            case
+            for case in CASES
+            if not args.case_names or case["name"] in set(args.case_names)
+        ]
+        report = run_all(cases, args.attempts, args.report_dir)
+        print(
+            json.dumps(
+                {"summary": report["summary"], "report": report["report_dir"]},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if report["summary"]["failed"] == 0 else 1
     return 2
 
 

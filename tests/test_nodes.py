@@ -181,6 +181,21 @@ def test_bad_value_hint_constant_requires_value():
     assert "antenna_pattern" not in hint
 
 
+def test_unknown_command_hint_handles_route_commands():
+    """speed/altitude 误写进 mover 时提示放回 route。"""
+    hint = nodes._unknown_command_hint(["ERROR: Unknown command: speed @ 'main.txt', line 5"])
+    assert "route" in hint
+    assert "mover" in hint
+
+
+def test_script_hint_mentions_units_and_semicolons():
+    """脚本编译失败时提示单位不能写进 JS 数字。"""
+    hint = nodes._script_hint(["ERROR: Unable to compile script. @ 'main.txt', line 63"])
+    assert "不能带单位" in hint
+    assert "分号" in hint
+    assert nodes._script_hint(["ERROR: Undefined radar_signature."]) == ""
+
+
 def test_unknown_command_hint_handles_blocks_and_end_markers():
     """普通未知命令提示整块处理，end_ 提示补闭合。"""
     hint = nodes._unknown_command_hint(

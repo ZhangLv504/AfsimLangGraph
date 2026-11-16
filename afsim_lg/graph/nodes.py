@@ -36,6 +36,9 @@ UNKNOWN_COMMAND_RE = re.compile(r"Unknown command:\s*([A-Za-z_][A-Za-z0-9_]*)", 
 CONSTANT_UNITS_ERROR_RE = re.compile(
     r"constant:.*units must be '?db'? or '?absolute'?", re.I
 )
+SCRIPT_ERROR_RE = re.compile(
+    r"Error in script|Unable to compile script|\";\" expected", re.I
+)
 SIGNATURE_LINE_RE = re.compile(r"^\s*radar_signature\s+([A-Za-z_][A-Za-z0-9_]*)(.*)$", re.I)
 SIGNATURE_BODY_TOKENS = {
     "constant",
@@ -797,6 +800,11 @@ def _unknown_command_hint(errors: list[str]) -> str:
                 "`antenna_pattern <名字>`，后接 constant/circular_pattern/rectangular_pattern "
                 "子块；删除 pattern_type、radius 这类不存在的参数。"
             )
+        elif name.lower() in {"speed", "altitude"}:
+            lines.append(
+                f"{name} 是 route 内命令，不能写在 mover 里；"
+                f"把它放到 route ... end_route 中。"
+            )
         elif name.lower().startswith("end_"):
             lines.append(
                 f"{name} 是闭合标记：前面有同名块未闭合或缺少对应块；"
@@ -861,6 +869,18 @@ def _constant_hint(errors: list[str]) -> str:
     return (
         "antenna_pattern 的 constant 用 db 或 absolute（如 constant 0 db）；"
         "radar_signature 的 constant 用面积单位（如 constant 10 m^2）。"
+    )
+
+
+def _script_hint(errors: list[str]) -> str:
+    """脚本编译失败时给出最常见的 JS 语法排查点。"""
+    if not any(SCRIPT_ERROR_RE.search(error) for error in errors):
+        return ""
+    return (
+        "脚本编译失败：script_variables/on_update 里是 JS 语法。常见错误：\n"
+        "1) 数字不能带单位（`double T = 10 sec;` 改成 `double T = 10;`）；\n"
+        "2) 每条语句以分号结尾；\n"
+        "3) 修不好就删除 script/processor 块，优先用纯 AFSIM 命令实现。"
     )
 
 
@@ -935,6 +955,9 @@ def fix(state: MainState) -> dict:
     constant_hint = _constant_hint(mission.get("errors", []))
     if constant_hint:
         parts.append(constant_hint)
+    script_hint = _script_hint(mission.get("errors", []))
+    if script_hint:
+        parts.append(script_hint)
     if assessment.get("missing"):
         parts.append("需求缺失：\n" + "\n".join(assessment["missing"]))
     if assessment.get("fix_hint"):
